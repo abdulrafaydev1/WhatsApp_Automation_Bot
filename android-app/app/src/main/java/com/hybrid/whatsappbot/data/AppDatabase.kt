@@ -17,14 +17,19 @@ class TaskTypeConverters {
 }
 
 @Database(
-    entities = [ScheduledTaskEntity::class],
-    version = 1,
+    entities = [
+        ScheduledTaskEntity::class,
+        AutoReplyRuleEntity::class
+    ],
+    version = 2,
     exportSchema = false
 )
 @TypeConverters(TaskTypeConverters::class)
 abstract class AppDatabase : RoomDatabase() {
 
     abstract fun taskDao(): TaskDao
+
+    abstract fun autoReplyRuleDao(): AutoReplyRuleDao
 
     companion object {
         @Volatile

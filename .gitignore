@@ -5,6 +5,8 @@ yarn-debug.log*
 yarn-error.log*
 backend/auth_info_baileys/
 backend/processed_tasks.json
+backend/auto_rules.json
+backend/auto_rule_media/
 
 # Android & Gradle Build Artifacts
 .gradle/

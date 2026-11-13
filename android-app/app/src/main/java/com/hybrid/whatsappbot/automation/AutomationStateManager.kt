@@ -3,6 +3,7 @@ package com.hybrid.whatsappbot.automation
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 
 /**
@@ -36,6 +37,7 @@ object AutomationStateManager {
     private const val DEFAULT_WINDOW_DURATION_MS = 20_000L
 
     private val sessionRef = AtomicReference<ActiveAutomationSession?>(null)
+    private val lastActivityMillis = AtomicLong(0L)
 
     private val _sessionFlow = MutableStateFlow<ActiveAutomationSession?>(null)
     val sessionFlow: StateFlow<ActiveAutomationSession?> = _sessionFlow.asStateFlow()
@@ -50,6 +52,7 @@ object AutomationStateManager {
         windowDurationMs: Long = DEFAULT_WINDOW_DURATION_MS
     ) {
         val now = System.currentTimeMillis()
+        lastActivityMillis.set(now)
         val session = ActiveAutomationSession(
             taskId = taskId,
             targetGroupName = targetGroupName.trim(),
@@ -62,6 +65,24 @@ object AutomationStateManager {
         )
         sessionRef.set(session)
         _sessionFlow.value = session
+    }
+
+    /**
+     * Records a bot send event (UI or Background) so NotificationListenerService ignores
+     * self-triggered notifications for the next 15 seconds.
+     */
+    fun markBotActivityNow() {
+        lastActivityMillis.set(System.currentTimeMillis())
+    }
+
+    /**
+     * Returns true if a task is currently active OR finished within the last [cooldownWindowMs].
+     */
+    fun wasRecentlyActive(cooldownWindowMs: Long = 15_000L): Boolean {
+        if (isTaskActive()) return true
+        val last = lastActivityMillis.get()
+        if (last <= 0L) return false
+        return (System.currentTimeMillis() - last) < cooldownWindowMs
     }
 
     /**
@@ -94,9 +115,11 @@ object AutomationStateManager {
             if (current.taskId != taskId) return false
             if (current.subState == UiBotSubState.STATE_5_DONE) return false
 
+            val now = System.currentTimeMillis()
+            lastActivityMillis.set(now)
             val updated = current.copy(
                 subState = newState,
-                stateEnteredAtMillis = System.currentTimeMillis(),
+                stateEnteredAtMillis = now,
                 attemptCountInState = 0,
                 pickerFabClicked = pickerFabClicked
             )
@@ -139,9 +162,11 @@ object AutomationStateManager {
             if (current.taskId != taskId) return false
             if (current.subState == UiBotSubState.STATE_5_DONE) return false
 
+            val now = System.currentTimeMillis()
+            lastActivityMillis.set(now)
             val updated = current.copy(
                 subState = UiBotSubState.STATE_5_DONE,
-                stateEnteredAtMillis = System.currentTimeMillis()
+                stateEnteredAtMillis = now
             )
             if (sessionRef.compareAndSet(current, updated)) {
                 _sessionFlow.value = updated
@@ -154,6 +179,7 @@ object AutomationStateManager {
      * Completely clears the active automation state.
      */
     fun clearSession() {
+        lastActivityMillis.set(System.currentTimeMillis())
         sessionRef.set(null)
         _sessionFlow.value = null
     }

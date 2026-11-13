@@ -9,6 +9,7 @@ import android.net.Uri
 import android.os.Build
 import android.os.PowerManager
 import android.provider.Settings
+import androidx.core.app.NotificationManagerCompat
 import com.hybrid.whatsappbot.service.WhatsAppAccessibilityService
 
 object SystemPermissionHelper {
@@ -30,6 +31,14 @@ object SystemPermissionHelper {
             .split(':')
             .mapNotNull { ComponentName.unflattenFromString(it) }
             .any { it == expectedComponent }
+    }
+
+    /**
+     * Checks whether WhatsAppNotificationListener has Notification Access enabled.
+     */
+    fun isNotificationListenerEnabled(context: Context): Boolean {
+        val enabledPackages = NotificationManagerCompat.getEnabledListenerPackages(context)
+        return enabledPackages.contains(context.packageName)
     }
 
     /**
@@ -57,6 +66,16 @@ object SystemPermissionHelper {
      */
     fun openAccessibilitySettings(context: Context) {
         val intent = Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS).apply {
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+        context.startActivity(intent)
+    }
+
+    /**
+     * Opens system Notification Listener Access Settings screen.
+     */
+    fun openNotificationListenerSettings(context: Context) {
+        val intent = Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS).apply {
             addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
         }
         context.startActivity(intent)

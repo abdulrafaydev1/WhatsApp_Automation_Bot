@@ -2,4 +2,5 @@
     <string name="app_name">WhatsApp Hybrid Bot</string>
     <string name="accessibility_service_label">WhatsApp Hybrid UI Scheduler</string>
     <string name="accessibility_service_description">Automates scheduled WhatsApp messages</string>
+    <string name="notification_listener_label">WhatsApp Group Activity Detector</string>
 </resources>

@@ -204,6 +204,7 @@ class ExecutionForegroundService : Service() {
 
             val body = response.body()
             if (response.isSuccessful && body != null && body.success) {
+                AutomationStateManager.markBotActivityNow()
                 val msgIdInfo = body.messageId ?: "OK"
                 dao.updateTaskStatus(
                     taskId = taskId,

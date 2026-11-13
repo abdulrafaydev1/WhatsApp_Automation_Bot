@@ -9,10 +9,12 @@ import okhttp3.logging.HttpLoggingInterceptor
 import retrofit2.Response
 import retrofit2.Retrofit
 import retrofit2.converter.gson.GsonConverterFactory
+import retrofit2.http.DELETE
 import retrofit2.http.GET
 import retrofit2.http.Multipart
 import retrofit2.http.POST
 import retrofit2.http.Part
+import retrofit2.http.Path
 import java.util.concurrent.TimeUnit
 
 data class LinkedUserDto(
@@ -26,6 +28,7 @@ data class ServerStatusResponse(
     val qrCode: String? = null,
     val user: LinkedUserDto? = null,
     val processedCount: Int = 0,
+    val activeAutoRulesCount: Int = 0,
     val timestamp: Long = 0L,
     val error: String? = null
 )
@@ -53,6 +56,11 @@ data class SendMediaResponse(
     val error: String? = null
 )
 
+data class AutoRuleSyncResponse(
+    val success: Boolean = false,
+    val error: String? = null
+)
+
 interface BotApiService {
 
     @GET("/api/v1/status")
@@ -70,6 +78,24 @@ interface BotApiService {
         @Part("caption") caption: RequestBody,
         @Part image: MultipartBody.Part
     ): Response<SendMediaResponse>
+
+    @Multipart
+    @POST("/api/v1/auto-rules")
+    suspend fun syncAutoRule(
+        @Part("ruleId") ruleId: RequestBody,
+        @Part("targetGroupName") targetGroupName: RequestBody,
+        @Part("targetGroupJid") targetGroupJid: RequestBody,
+        @Part("matchAllGroups") matchAllGroups: RequestBody,
+        @Part("caption") caption: RequestBody,
+        @Part("cooldownMillis") cooldownMillis: RequestBody,
+        @Part("isEnabled") isEnabled: RequestBody,
+        @Part image: MultipartBody.Part? = null
+    ): Response<AutoRuleSyncResponse>
+
+    @DELETE("/api/v1/auto-rules/{ruleId}")
+    suspend fun deleteAutoRule(
+        @Path("ruleId") ruleId: String
+    ): Response<AutoRuleSyncResponse>
 }
 
 object RetrofitClient {

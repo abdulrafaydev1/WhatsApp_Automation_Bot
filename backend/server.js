@@ -19,6 +19,12 @@ const {
 const PORT = process.env.PORT || 3000;
 const AUTH_DIR = path.join(__dirname, 'auth_info_baileys');
 const PROCESSED_TASKS_FILE = path.join(__dirname, 'processed_tasks.json');
+const AUTO_RULES_FILE = path.join(__dirname, 'auto_rules.json');
+const AUTO_MEDIA_DIR = path.join(__dirname, 'auto_rule_media');
+
+if (!fs.existsSync(AUTO_MEDIA_DIR)) {
+  fs.mkdirSync(AUTO_MEDIA_DIR, { recursive: true });
+}
 
 const app = express();
 app.use(cors());
@@ -41,6 +47,11 @@ const baileysLogger = pino({ level: 'silent' });
 const processedTaskIds = new Set();
 const inFlightTaskIds = new Set();
 
+// Cooldown & Anti-Self-Loop tracking for 24/7 Baileys Auto-Responder Rules
+const autoRulesMap = new Map(); // ruleId -> rule object
+const autoCooldownMap = new Map(); // `${ruleId}_${remoteJid}` -> timestampMs
+const recentBotGroupSends = new Map(); // remoteJid -> timestampMs
+
 function loadProcessedTasks() {
   try {
     if (fs.existsSync(PROCESSED_TASKS_FILE)) {
@@ -58,7 +69,6 @@ function loadProcessedTasks() {
 function saveProcessedTask(taskId) {
   processedTaskIds.add(taskId);
   try {
-    // Keep last 5,000 task IDs on disk
     const serialized = JSON.stringify(Array.from(processedTaskIds).slice(-5000), null, 2);
     fs.writeFileSync(PROCESSED_TASKS_FILE, serialized, 'utf-8');
   } catch (err) {
@@ -66,7 +76,35 @@ function saveProcessedTask(taskId) {
   }
 }
 
+function loadAutoRules() {
+  try {
+    if (fs.existsSync(AUTO_RULES_FILE)) {
+      const raw = fs.readFileSync(AUTO_RULES_FILE, 'utf-8');
+      const list = JSON.parse(raw);
+      if (Array.isArray(list)) {
+        list.forEach((rule) => {
+          if (rule && rule.ruleId) {
+            autoRulesMap.set(rule.ruleId, rule);
+          }
+        });
+      }
+    }
+  } catch (err) {
+    logger.warn({ err }, 'Could not load auto_rules.json, starting with empty rules.');
+  }
+}
+
+function saveAutoRules() {
+  try {
+    const serialized = JSON.stringify(Array.from(autoRulesMap.values()), null, 2);
+    fs.writeFileSync(AUTO_RULES_FILE, serialized, 'utf-8');
+  } catch (err) {
+    logger.warn({ err }, 'Could not persist auto_rules.json');
+  }
+}
+
 loadProcessedTasks();
+loadAutoRules();
 
 // Global WhatsApp Connection State
 let sock = null;
@@ -74,6 +112,7 @@ let connectionState = 'DISCONNECTED'; // 'CONNECTED' | 'QR_READY' | 'DISCONNECTE
 let latestQrBase64 = null;
 let latestRawQr = null;
 let reconnectTimer = null;
+const groupSubjectCache = new Map(); // groupJid -> subject
 
 /**
  * Initializes and maintains the persistent Baileys WhatsApp Web Socket.
@@ -140,6 +179,8 @@ async function initWhatsAppConnection() {
           { user: sock?.user },
           'WhatsApp Background Bot successfully connected and ready.'
         );
+        // Warm up group cache in background
+        refreshGroupCache().catch(() => {});
       }
 
       if (connection === 'close') {
@@ -150,10 +191,7 @@ async function initWhatsAppConnection() {
         const statusCode = lastDisconnect?.error?.output?.statusCode;
         const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
 
-        logger.warn(
-          { statusCode, shouldReconnect },
-          'WhatsApp connection closed.'
-        );
+        logger.warn({ statusCode, shouldReconnect }, 'WhatsApp connection closed.');
 
         if (statusCode === DisconnectReason.loggedOut) {
           logger.warn('Session logged out from phone. Clearing auth_info_baileys for fresh QR...');
@@ -168,10 +206,146 @@ async function initWhatsAppConnection() {
         }
       }
     });
+
+    // =========================================================================
+    // 24/7 REAL-TIME GROUP ACTIVITY AUTO-RESPONDER (messages.upsert)
+    // =========================================================================
+    sock.ev.on('messages.upsert', async ({ messages, type }) => {
+      if (type !== 'notify' || !Array.isArray(messages)) return;
+
+      for (const msg of messages) {
+        try {
+          await handleIncomingGroupMessageForAutoRules(msg);
+        } catch (err) {
+          logger.error({ err }, 'Error evaluating incoming group message for auto-rules');
+        }
+      }
+    });
   } catch (err) {
     logger.error({ err }, 'Error initializing WhatsApp socket, retrying in 5 seconds...');
     connectionState = 'DISCONNECTED';
     reconnectTimer = setTimeout(() => initWhatsAppConnection(), 5000);
+  }
+}
+
+async function refreshGroupCache() {
+  if (!sock || connectionState !== 'CONNECTED') return;
+  const groupsMap = await sock.groupFetchAllParticipating();
+  Object.values(groupsMap || {}).forEach((g) => {
+    if (g && g.id && g.subject) {
+      groupSubjectCache.set(g.id, g.subject);
+    }
+  });
+}
+
+async function getGroupSubjectByJid(remoteJid) {
+  if (groupSubjectCache.has(remoteJid)) {
+    return groupSubjectCache.get(remoteJid);
+  }
+  try {
+    const meta = await sock.groupMetadata(remoteJid);
+    if (meta && meta.subject) {
+      groupSubjectCache.set(remoteJid, meta.subject);
+      return meta.subject;
+    }
+  } catch (_) {
+    // Ignore metadata lookup error
+  }
+  return '';
+}
+
+/**
+ * Evaluates incoming group messages against synced Auto-Reply Rules when server-side
+ * execution is enabled.
+ */
+async function handleIncomingGroupMessageForAutoRules(msg) {
+  if (!msg || !msg.key || !msg.message) return;
+
+  const remoteJid = msg.key.remoteJid || '';
+  if (!remoteJid.endsWith('@g.us')) return; // Ignore non-group messages
+  if (msg.key.fromMe) return; // Never react to our own messages
+
+  // Ignore protocol / reaction / receipt / stub messages
+  const messageTypes = Object.keys(msg.message);
+  const isRealUserPost = messageTypes.some((t) =>
+    [
+      'conversation',
+      'extendedTextMessage',
+      'imageMessage',
+      'videoMessage',
+      'documentMessage',
+      'audioMessage'
+    ].includes(t)
+  );
+  if (!isRealUserPost) return;
+
+  // Anti-self-loop guard: ignore if bot sent to this group in the last 15 seconds
+  const now = Date.now();
+  const lastBotSend = recentBotGroupSends.get(remoteJid) || 0;
+  if (now - lastBotSend < 15000) {
+    return;
+  }
+
+  const enabledRules = Array.from(autoRulesMap.values()).filter(
+    (r) => r.isEnabled && r.serverAutoExecute !== false
+  );
+  if (enabledRules.length === 0) return;
+
+  const groupSubject = await getGroupSubjectByJid(remoteJid);
+  const normalizedSubject = (groupSubject || '').trim().toLowerCase();
+
+  for (const rule of enabledRules) {
+    let isMatch = false;
+    if (rule.matchAllGroups) {
+      isMatch = true;
+    } else if (rule.targetGroupJid && rule.targetGroupJid.trim() === remoteJid) {
+      isMatch = true;
+    } else if (rule.targetGroupName && normalizedSubject) {
+      const targetNorm = rule.targetGroupName.trim().toLowerCase();
+      isMatch =
+        normalizedSubject === targetNorm || normalizedSubject.includes(targetNorm);
+    }
+
+    if (!isMatch) continue;
+
+    // Check per-rule, per-group cooldown
+    const cooldownKey = `${rule.ruleId}_${remoteJid}`;
+    const lastTriggered = autoCooldownMap.get(cooldownKey) || 0;
+    const cooldownMs = Number(rule.cooldownMillis) || 120000;
+
+    if (now - lastTriggered < cooldownMs) {
+      logger.debug(
+        { ruleId: rule.ruleId, remoteJid, groupSubject },
+        'Auto-rule matched group post, but cooldown is still active.'
+      );
+      continue;
+    }
+
+    if (!rule.imageFilePath || !fs.existsSync(rule.imageFilePath)) {
+      logger.warn({ ruleId: rule.ruleId }, 'Auto-rule image file missing on server disk.');
+      continue;
+    }
+
+    // Lock cooldown & anti-loop timestamps immediately before sending
+    autoCooldownMap.set(cooldownKey, now);
+    recentBotGroupSends.set(remoteJid, now);
+
+    const imageBuffer = fs.readFileSync(rule.imageFilePath);
+    await sock.sendMessage(remoteJid, {
+      image: imageBuffer,
+      mimetype: rule.mimeType || 'image/jpeg',
+      caption: rule.caption || ''
+    });
+
+    rule.triggerCount = (Number(rule.triggerCount) || 0) + 1;
+    rule.lastTriggeredAtMillis = now;
+    rule.lastTriggeredGroup = groupSubject || remoteJid;
+    saveAutoRules();
+
+    logger.info(
+      { ruleId: rule.ruleId, remoteJid, groupSubject },
+      'Auto-Responder Rule triggered and delivered group media post via Baileys!'
+    );
   }
 }
 
@@ -222,10 +396,6 @@ async function resolveGroupJid(groupName, explicitGroupJid) {
 // REST API ENDPOINTS
 // ============================================================================
 
-/**
- * GET /api/v1/status
- * Returns live connection state ('CONNECTED', 'QR_READY', 'DISCONNECTED') and Base64 QR code.
- */
 app.get('/api/v1/status', async (req, res) => {
   try {
     return res.status(200).json({
@@ -240,6 +410,7 @@ app.get('/api/v1/status', async (req, res) => {
           }
         : null,
       processedCount: processedTaskIds.size,
+      activeAutoRulesCount: Array.from(autoRulesMap.values()).filter((r) => r.isEnabled).length,
       timestamp: Date.now()
     });
   } catch (err) {
@@ -252,10 +423,6 @@ app.get('/api/v1/status', async (req, res) => {
   }
 });
 
-/**
- * POST /api/v1/pair-code
- * Optional helper to request an 8-digit WhatsApp phone pairing code instead of scanning QR.
- */
 app.post('/api/v1/pair-code', async (req, res) => {
   try {
     const { phoneNumber } = req.body;
@@ -287,10 +454,6 @@ app.post('/api/v1/pair-code', async (req, res) => {
   }
 });
 
-/**
- * GET /api/v1/groups
- * Fetches all participating groups via sock.groupFetchAllParticipating() for Android autocomplete.
- */
 app.get('/api/v1/groups', async (req, res) => {
   try {
     if (!sock || connectionState !== 'CONNECTED') {
@@ -304,11 +467,16 @@ app.get('/api/v1/groups', async (req, res) => {
 
     const groupsMap = await sock.groupFetchAllParticipating();
     const groups = Object.values(groupsMap || {})
-      .map((group) => ({
-        id: group.id,
-        subject: group.subject || 'Unnamed Group',
-        participantsCount: Array.isArray(group.participants) ? group.participants.length : 0
-      }))
+      .map((group) => {
+        if (group.id && group.subject) {
+          groupSubjectCache.set(group.id, group.subject);
+        }
+        return {
+          id: group.id,
+          subject: group.subject || 'Unnamed Group',
+          participantsCount: Array.isArray(group.participants) ? group.participants.length : 0
+        };
+      })
       .sort((a, b) => a.subject.localeCompare(b.subject));
 
     return res.status(200).json({
@@ -326,15 +494,6 @@ app.get('/api/v1/groups', async (req, res) => {
   }
 });
 
-/**
- * POST /api/v1/send-group-media
- * Multipart endpoint receiving:
- * - taskId (UUID for strict idempotency)
- * - groupName (Subject name or JID)
- * - groupJid (Optional explicit @g.us JID)
- * - caption (Text caption)
- * - image (Binary file uploaded via Multer memoryStorage)
- */
 app.post('/api/v1/send-group-media', upload.single('image'), async (req, res) => {
   const taskId = (req.body.taskId || '').trim();
   const groupName = (req.body.groupName || '').trim();
@@ -389,6 +548,7 @@ app.post('/api/v1/send-group-media', upload.single('image'), async (req, res) =>
 
   try {
     const resolvedJid = await resolveGroupJid(groupName, groupJid);
+    recentBotGroupSends.set(resolvedJid, Date.now());
 
     logger.info(
       {
@@ -406,7 +566,6 @@ app.post('/api/v1/send-group-media', upload.single('image'), async (req, res) =>
       caption: caption
     });
 
-    // Record taskId as completed for strict idempotency
     saveProcessedTask(taskId);
     inFlightTaskIds.delete(taskId);
 
@@ -432,18 +591,106 @@ app.post('/api/v1/send-group-media', upload.single('image'), async (req, res) =>
   }
 });
 
-/**
- * POST /api/v1/logout
- * Resets the current WhatsApp session and generates a new QR code.
- */
+// ============================================================================
+// AUTO-RESPONDER RULES SYNC ENDPOINTS (/api/v1/auto-rules)
+// ============================================================================
+
+app.get('/api/v1/auto-rules', (req, res) => {
+  const rules = Array.from(autoRulesMap.values()).map((r) => ({
+    ruleId: r.ruleId,
+    targetGroupName: r.targetGroupName,
+    targetGroupJid: r.targetGroupJid || null,
+    matchAllGroups: Boolean(r.matchAllGroups),
+    caption: r.caption || '',
+    cooldownMillis: Number(r.cooldownMillis) || 120000,
+    isEnabled: Boolean(r.isEnabled),
+    triggerCount: Number(r.triggerCount) || 0,
+    lastTriggeredAtMillis: Number(r.lastTriggeredAtMillis) || 0,
+    lastTriggeredGroup: r.lastTriggeredGroup || null
+  }));
+  return res.status(200).json({
+    success: true,
+    count: rules.length,
+    rules
+  });
+});
+
+app.post('/api/v1/auto-rules', upload.single('image'), (req, res) => {
+  try {
+    const ruleId = (req.body.ruleId || '').trim();
+    if (!ruleId) {
+      return res.status(400).json({ success: false, error: 'Missing required field: ruleId' });
+    }
+
+    const existing = autoRulesMap.get(ruleId);
+    let imageFilePath = existing?.imageFilePath || null;
+    let mimeType = existing?.mimeType || 'image/jpeg';
+
+    if (req.file && req.file.buffer) {
+      const ext = (req.file.originalname || 'img.jpg').split('.').pop() || 'jpg';
+      imageFilePath = path.join(AUTO_MEDIA_DIR, `rule_${ruleId}.${ext}`);
+      fs.writeFileSync(imageFilePath, req.file.buffer);
+      mimeType = req.file.mimetype || 'image/jpeg';
+    }
+
+    const matchAllGroups =
+      String(req.body.matchAllGroups).toLowerCase() === 'true' ||
+      req.body.targetGroupName === 'ALL_GROUPS';
+
+    const ruleObj = {
+      ruleId,
+      targetGroupName: (req.body.targetGroupName || 'ALL_GROUPS').trim(),
+      targetGroupJid: (req.body.targetGroupJid || '').trim() || null,
+      matchAllGroups,
+      caption: req.body.caption || '',
+      cooldownMillis: Number(req.body.cooldownMillis) || 120000,
+      isEnabled: String(req.body.isEnabled ?? 'true').toLowerCase() !== 'false',
+      // By default Android NotificationListener handles triggers using the Hybrid Engine;
+      // serverAutoExecute can be enabled when the phone is completely powered off.
+      serverAutoExecute: String(req.body.serverAutoExecute ?? 'false').toLowerCase() === 'true',
+      imageFilePath,
+      mimeType,
+      triggerCount: existing?.triggerCount || 0,
+      lastTriggeredAtMillis: existing?.lastTriggeredAtMillis || 0,
+      lastTriggeredGroup: existing?.lastTriggeredGroup || null,
+      updatedAtMillis: Date.now()
+    };
+
+    autoRulesMap.set(ruleId, ruleObj);
+    saveAutoRules();
+
+    return res.status(200).json({
+      success: true,
+      rule: ruleObj
+    });
+  } catch (err) {
+    logger.error({ err }, 'POST /api/v1/auto-rules failed');
+    return res.status(500).json({
+      success: false,
+      error: err.message
+    });
+  }
+});
+
+app.delete('/api/v1/auto-rules/:ruleId', (req, res) => {
+  const { ruleId } = req.params;
+  const existing = autoRulesMap.get(ruleId);
+  if (existing && existing.imageFilePath && fs.existsSync(existing.imageFilePath)) {
+    try {
+      fs.unlinkSync(existing.imageFilePath);
+    } catch (_) {}
+  }
+  autoRulesMap.delete(ruleId);
+  saveAutoRules();
+  return res.status(200).json({ success: true, ruleId });
+});
+
 app.post('/api/v1/logout', async (req, res) => {
   try {
     if (sock) {
       try {
         await sock.logout();
-      } catch (_) {
-        // Ignore if already disconnected
-      }
+      } catch (_) {}
     }
     fs.rmSync(AUTH_DIR, { recursive: true, force: true });
     connectionState = 'DISCONNECTED';
@@ -461,7 +708,6 @@ app.post('/api/v1/logout', async (req, res) => {
   }
 });
 
-// Start Express Server & Baileys Socket
 app.listen(PORT, '0.0.0.0', () => {
   logger.info(`Hybrid WhatsApp Scheduler Backend listening on http://0.0.0.0:${PORT}`);
   initWhatsAppConnection();

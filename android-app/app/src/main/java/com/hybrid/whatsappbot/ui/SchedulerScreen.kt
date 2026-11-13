@@ -13,6 +13,7 @@ import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -27,16 +28,16 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
-import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.AddPhotoAlternate
+import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Error
 import androidx.compose.material.icons.filled.Groups
 import androidx.compose.material.icons.filled.PlayArrow
-import androidx.compose.material.icons.filled.QrCode2
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Schedule
 import androidx.compose.material3.AlertDialog
@@ -46,14 +47,20 @@ import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.FilterChip
+import androidx.compose.material3.FilterChipDefaults
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
+import androidx.compose.material3.Tab
+import androidx.compose.material3.TabRow
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
@@ -62,6 +69,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -82,6 +90,7 @@ import androidx.compose.ui.unit.sp
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import coil.compose.AsyncImage
+import com.hybrid.whatsappbot.data.AutoReplyRuleEntity
 import com.hybrid.whatsappbot.data.ScheduledTaskEntity
 import com.hybrid.whatsappbot.data.TaskStatus
 import com.hybrid.whatsappbot.util.SystemPermissionHelper
@@ -91,6 +100,19 @@ import java.util.Calendar
 import java.util.Date
 import java.util.Locale
 
+data class CooldownOption(
+    val label: String,
+    val durationMillis: Long
+)
+
+private val COOLDOWN_OPTIONS = listOf(
+    CooldownOption("30 Sec", 30_000L),
+    CooldownOption("2 Min", 120_000L),
+    CooldownOption("5 Min", 300_000L),
+    CooldownOption("15 Min", 900_000L),
+    CooldownOption("1 Hour", 3_600_000L)
+)
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun SchedulerScreen(viewModel: SchedulerViewModel) {
@@ -98,6 +120,7 @@ fun SchedulerScreen(viewModel: SchedulerViewModel) {
     val lifecycleOwner = LocalLifecycleOwner.current
 
     val tasks by viewModel.tasksState.collectAsState()
+    val autoRules by viewModel.autoRulesState.collectAsState()
     val serverUiState by viewModel.serverUiState.collectAsState()
 
     // Live System Readiness states refreshed automatically on ON_RESUME
@@ -110,6 +133,9 @@ fun SchedulerScreen(viewModel: SchedulerViewModel) {
     var isBatteryOptimizationIgnored by remember {
         mutableStateOf(SystemPermissionHelper.isIgnoringBatteryOptimizations(context))
     }
+    var isNotificationListenerEnabled by remember {
+        mutableStateOf(SystemPermissionHelper.isNotificationListenerEnabled(context))
+    }
 
     DisposableEffect(lifecycleOwner) {
         val observer = LifecycleEventObserver { _, event ->
@@ -117,6 +143,7 @@ fun SchedulerScreen(viewModel: SchedulerViewModel) {
                 isAccessibilityEnabled = SystemPermissionHelper.isAccessibilityServiceEnabled(context)
                 canScheduleExactAlarms = SystemPermissionHelper.canScheduleExactAlarms(context)
                 isBatteryOptimizationIgnored = SystemPermissionHelper.isIgnoringBatteryOptimizations(context)
+                isNotificationListenerEnabled = SystemPermissionHelper.isNotificationListenerEnabled(context)
             }
         }
         lifecycleOwner.lifecycle.addObserver(observer)
@@ -125,7 +152,10 @@ fun SchedulerScreen(viewModel: SchedulerViewModel) {
         }
     }
 
-    // Scheduler Form State
+    // Mode Selector Tab: 0 = Time Scheduler, 1 = Auto-Post on Group Activity
+    var selectedTabIndex by rememberSaveable { mutableIntStateOf(0) }
+
+    // Shared Creation Form State
     var selectedImageUri by rememberSaveable { mutableStateOf<Uri?>(null) }
     var captionText by rememberSaveable { mutableStateOf("") }
     var targetGroupName by rememberSaveable { mutableStateOf("") }
@@ -133,6 +163,10 @@ fun SchedulerScreen(viewModel: SchedulerViewModel) {
     var scheduledTimeMillis by rememberSaveable {
         mutableLongStateOf(System.currentTimeMillis() + 5 * 60 * 1000L)
     }
+
+    // Auto-Responder Specific Form State
+    var matchAllGroups by rememberSaveable { mutableStateOf(false) }
+    var selectedCooldownMillis by rememberSaveable { mutableLongStateOf(120_000L) }
 
     var backendUrlInput by rememberSaveable(serverUiState.backendUrl) {
         mutableStateOf(serverUiState.backendUrl)
@@ -154,13 +188,13 @@ fun SchedulerScreen(viewModel: SchedulerViewModel) {
                 title = {
                     Column {
                         Text(
-                            text = "Hybrid WhatsApp Scheduler",
+                            text = "Hybrid WhatsApp Scheduler & Auto-Bot",
                             fontWeight = FontWeight.Bold,
                             fontSize = 18.sp
                         )
                         Text(
-                            text = "Dual-Engine: UI Accessibility + Node.js Baileys Bot",
-                            fontSize = 12.sp,
+                            text = "Time Scheduler + Real-Time Group Activity Auto-Responder",
+                            fontSize = 11.sp,
                             color = Color.White.copy(alpha = 0.85f)
                         )
                     }
@@ -189,12 +223,13 @@ fun SchedulerScreen(viewModel: SchedulerViewModel) {
             contentPadding = PaddingValues(16.dp),
             verticalArrangement = Arrangement.spacedBy(16.dp)
         ) {
-            // 1. SYSTEM READINESS CARD
+            // 1. SYSTEM READINESS CARD (Items 1 to 5)
             item {
                 SystemReadinessCard(
                     isAccessibilityEnabled = isAccessibilityEnabled,
                     canScheduleExactAlarms = canScheduleExactAlarms,
                     isBatteryOptimizationIgnored = isBatteryOptimizationIgnored,
+                    isNotificationListenerEnabled = isNotificationListenerEnabled,
                     serverUiState = serverUiState,
                     backendUrlInput = backendUrlInput,
                     onBackendUrlChange = { backendUrlInput = it },
@@ -204,13 +239,18 @@ fun SchedulerScreen(viewModel: SchedulerViewModel) {
                     onRequestBatteryExemption = {
                         SystemPermissionHelper.requestIgnoreBatteryOptimizations(context)
                     },
+                    onOpenNotificationListener = {
+                        SystemPermissionHelper.openNotificationListenerSettings(context)
+                    },
                     onShowQrModal = { showQrDialog = true }
                 )
             }
 
-            // 2. SCHEDULER FORM CARD
+            // 2. DUAL-MODE CREATION CARD (Tab 1: Time Scheduler | Tab 2: Auto-Post on Group Activity)
             item {
-                SchedulerFormCard(
+                DualModeCreationCard(
+                    selectedTabIndex = selectedTabIndex,
+                    onSelectTab = { selectedTabIndex = it },
                     selectedImageUri = selectedImageUri,
                     captionText = captionText,
                     onCaptionChange = { captionText = it },
@@ -222,6 +262,10 @@ fun SchedulerScreen(viewModel: SchedulerViewModel) {
                     },
                     scheduledTimeMillis = scheduledTimeMillis,
                     onScheduledTimeChange = { scheduledTimeMillis = it },
+                    matchAllGroups = matchAllGroups,
+                    onMatchAllGroupsChange = { matchAllGroups = it },
+                    selectedCooldownMillis = selectedCooldownMillis,
+                    onCooldownChange = { selectedCooldownMillis = it },
                     onPickImage = {
                         imagePickerLauncher.launch(
                             PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
@@ -240,15 +284,15 @@ fun SchedulerScreen(viewModel: SchedulerViewModel) {
                             }
                         }
                     },
-                    onScheduleSubmit = {
+                    onScheduleTimeSubmit = {
                         val imageUri = selectedImageUri
                         if (imageUri == null) {
                             Toast.makeText(context, "Please select an image first.", Toast.LENGTH_SHORT).show()
-                            return@SchedulerFormCard
+                            return@DualModeCreationCard
                         }
                         if (targetGroupName.isBlank()) {
                             Toast.makeText(context, "Please enter or select a Target Group Name.", Toast.LENGTH_SHORT).show()
-                            return@SchedulerFormCard
+                            return@DualModeCreationCard
                         }
                         viewModel.scheduleTask(
                             sourceImageUri = imageUri,
@@ -263,11 +307,83 @@ fun SchedulerScreen(viewModel: SchedulerViewModel) {
                                 captionText = ""
                             }
                         }
+                    },
+                    onActivateAutoRuleSubmit = {
+                        val imageUri = selectedImageUri
+                        if (imageUri == null) {
+                            Toast.makeText(context, "Please select an image first.", Toast.LENGTH_SHORT).show()
+                            return@DualModeCreationCard
+                        }
+                        if (!matchAllGroups && targetGroupName.isBlank()) {
+                            Toast.makeText(
+                                context,
+                                "Please enter a Specific Group Name or select 'Any WhatsApp Group'.",
+                                Toast.LENGTH_SHORT
+                            ).show()
+                            return@DualModeCreationCard
+                        }
+                        viewModel.createAutoReplyRule(
+                            sourceImageUri = imageUri,
+                            caption = captionText,
+                            targetGroupName = targetGroupName,
+                            targetGroupJid = targetGroupJid,
+                            matchAllGroups = matchAllGroups,
+                            cooldownMillis = selectedCooldownMillis
+                        ) { success, message ->
+                            Toast.makeText(context, message, Toast.LENGTH_LONG).show()
+                            if (success) {
+                                selectedImageUri = null
+                                captionText = ""
+                            }
+                        }
                     }
                 )
             }
 
-            // 3. TASK QUEUE HEADER
+            // 3. ACTIVE AUTO-RESPONDER RULES SECTION
+            if (autoRules.isNotEmpty() || selectedTabIndex == 1) {
+                item {
+                    Text(
+                        text = "Auto-Responder Rules (${autoRules.size})",
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.Bold
+                    )
+                }
+
+                if (autoRules.isEmpty()) {
+                    item {
+                        Card(
+                            modifier = Modifier.fillMaxWidth(),
+                            colors = CardDefaults.cardColors(containerColor = Color.White)
+                        ) {
+                            Box(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(20.dp),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Text(
+                                    text = "No active Auto-Responder rules yet. Create one above to automatically post your image + caption whenever someone posts in a group!",
+                                    color = Color.Gray,
+                                    fontSize = 13.sp
+                                )
+                            }
+                        }
+                    }
+                } else {
+                    items(items = autoRules, key = { "rule_${it.ruleId}" }) { rule ->
+                        AutoReplyRuleItemCard(
+                            rule = rule,
+                            onToggleEnabled = { enabled ->
+                                viewModel.toggleAutoReplyRule(rule, enabled)
+                            },
+                            onDelete = { viewModel.deleteAutoReplyRule(rule) }
+                        )
+                    }
+                }
+            }
+
+            // 4. SCHEDULED & AUTO-TRIGGERED TASK QUEUE HEADER
             item {
                 Row(
                     modifier = Modifier.fillMaxWidth(),
@@ -295,7 +411,7 @@ fun SchedulerScreen(viewModel: SchedulerViewModel) {
                             contentAlignment = Alignment.Center
                         ) {
                             Text(
-                                text = "No scheduled tasks yet. Pick an image and schedule your first hybrid WhatsApp post above!",
+                                text = "No scheduled or auto-triggered tasks yet.",
                                 color = Color.Gray
                             )
                         }
@@ -339,6 +455,7 @@ fun SchedulerScreen(viewModel: SchedulerViewModel) {
                                 .clickable {
                                     targetGroupName = group.subject
                                     targetGroupJid = group.id
+                                    matchAllGroups = false
                                     showGroupPickerDialog = false
                                 },
                             colors = CardDefaults.cardColors(
@@ -417,6 +534,7 @@ private fun SystemReadinessCard(
     isAccessibilityEnabled: Boolean,
     canScheduleExactAlarms: Boolean,
     isBatteryOptimizationIgnored: Boolean,
+    isNotificationListenerEnabled: Boolean,
     serverUiState: ServerUiState,
     backendUrlInput: String,
     onBackendUrlChange: (String) -> Unit,
@@ -424,6 +542,7 @@ private fun SystemReadinessCard(
     onOpenAccessibility: () -> Unit,
     onOpenExactAlarm: () -> Unit,
     onRequestBatteryExemption: () -> Unit,
+    onOpenNotificationListener: () -> Unit,
     onShowQrModal: () -> Unit
 ) {
     Card(
@@ -443,7 +562,7 @@ private fun SystemReadinessCard(
 
             ReadinessRow(
                 title = "1. UI Accessibility Service (Engine 1)",
-                subtitle = if (isAccessibilityEnabled) "Active (20s Window Lock Ready)" else "Disabled in Android Settings",
+                subtitle = if (isAccessibilityEnabled) "Active (5-Stage UI Bot Ready)" else "Disabled in Android Settings",
                 isReady = isAccessibilityEnabled,
                 actionLabel = if (isAccessibilityEnabled) "Settings" else "Enable",
                 onActionClick = onOpenAccessibility
@@ -482,6 +601,18 @@ private fun SystemReadinessCard(
                         onSaveBackendUrl()
                     }
                 }
+            )
+
+            ReadinessRow(
+                title = "5. Notification Listener (Group Post Detector)",
+                subtitle = if (isNotificationListenerEnabled) {
+                    "Listening for real-time WhatsApp group posts"
+                } else {
+                    "Required for Auto-Post on Group Activity"
+                },
+                isReady = isNotificationListenerEnabled,
+                actionLabel = if (isNotificationListenerEnabled) "Verified" else "Grant",
+                onActionClick = onOpenNotificationListener
             )
 
             HorizontalDivider(modifier = Modifier.padding(vertical = 4.dp))
@@ -562,7 +693,9 @@ private fun ReadinessRow(
 }
 
 @Composable
-private fun SchedulerFormCard(
+private fun DualModeCreationCard(
+    selectedTabIndex: Int,
+    onSelectTab: (Int) -> Unit,
     selectedImageUri: Uri?,
     captionText: String,
     onCaptionChange: (String) -> Unit,
@@ -571,9 +704,14 @@ private fun SchedulerFormCard(
     onTargetGroupNameChange: (String) -> Unit,
     scheduledTimeMillis: Long,
     onScheduledTimeChange: (Long) -> Unit,
+    matchAllGroups: Boolean,
+    onMatchAllGroupsChange: (Boolean) -> Unit,
+    selectedCooldownMillis: Long,
+    onCooldownChange: (Long) -> Unit,
     onPickImage: () -> Unit,
     onSyncGroupsClick: () -> Unit,
-    onScheduleSubmit: () -> Unit
+    onScheduleTimeSubmit: () -> Unit,
+    onActivateAutoRuleSubmit: () -> Unit
 ) {
     val context = LocalContext.current
     val dateFormat = remember { SimpleDateFormat("EEE, dd MMM yyyy • hh:mm a", Locale.getDefault()) }
@@ -583,172 +721,464 @@ private fun SchedulerFormCard(
         colors = CardDefaults.cardColors(containerColor = Color.White),
         elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
     ) {
-        Column(
-            modifier = Modifier.padding(16.dp),
-            verticalArrangement = Arrangement.spacedBy(12.dp)
-        ) {
-            Text(
-                text = "Schedule New WhatsApp Group Post",
-                style = MaterialTheme.typography.titleMedium,
-                fontWeight = FontWeight.Bold
-            )
-
-            // Image Picker + Thumbnail Preview
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(12.dp)
+        Column(modifier = Modifier.fillMaxWidth()) {
+            // Mode Selector Tabs
+            TabRow(
+                selectedTabIndex = selectedTabIndex,
+                containerColor = Color(0xFFE8F5E9),
+                contentColor = MaterialTheme.colorScheme.primary
             ) {
-                Box(
-                    modifier = Modifier
-                        .size(88.dp)
-                        .clip(RoundedCornerShape(10.dp))
-                        .background(Color(0xFFECEFF1))
-                        .border(1.dp, Color(0xFFCFD8DC), RoundedCornerShape(10.dp))
-                        .clickable { onPickImage() },
-                    contentAlignment = Alignment.Center
-                ) {
-                    if (selectedImageUri != null) {
-                        AsyncImage(
-                            model = selectedImageUri,
-                            contentDescription = "Selected Image",
-                            contentScale = ContentScale.Crop,
-                            modifier = Modifier.fillMaxSize()
+                Tab(
+                    selected = selectedTabIndex == 0,
+                    onClick = { onSelectTab(0) },
+                    text = {
+                        Text(
+                            text = "Time Scheduler",
+                            fontWeight = if (selectedTabIndex == 0) FontWeight.Bold else FontWeight.Normal,
+                            fontSize = 13.sp
                         )
-                    } else {
+                    },
+                    icon = {
                         Icon(
-                            imageVector = Icons.Default.AddPhotoAlternate,
-                            contentDescription = "Pick Image",
-                            tint = Color.DarkGray,
-                            modifier = Modifier.size(32.dp)
+                            imageVector = Icons.Default.Schedule,
+                            contentDescription = null,
+                            modifier = Modifier.size(18.dp)
+                        )
+                    }
+                )
+                Tab(
+                    selected = selectedTabIndex == 1,
+                    onClick = { onSelectTab(1) },
+                    text = {
+                        Text(
+                            text = "Auto-Post on Group Activity",
+                            fontWeight = if (selectedTabIndex == 1) FontWeight.Bold else FontWeight.Normal,
+                            fontSize = 13.sp
+                        )
+                    },
+                    icon = {
+                        Icon(
+                            imageVector = Icons.Default.AutoAwesome,
+                            contentDescription = null,
+                            modifier = Modifier.size(18.dp)
+                        )
+                    }
+                )
+            }
+
+            Column(
+                modifier = Modifier.padding(16.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                Text(
+                    text = if (selectedTabIndex == 0) {
+                        "Schedule Exact Date & Time Group Post"
+                    } else {
+                        "Auto-Post Whenever Someone Posts in a Group"
+                    },
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.Bold
+                )
+
+                // Shared Image Picker + Thumbnail Preview
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .size(88.dp)
+                            .clip(RoundedCornerShape(10.dp))
+                            .background(Color(0xFFECEFF1))
+                            .border(1.dp, Color(0xFFCFD8DC), RoundedCornerShape(10.dp))
+                            .clickable { onPickImage() },
+                        contentAlignment = Alignment.Center
+                    ) {
+                        if (selectedImageUri != null) {
+                            AsyncImage(
+                                model = selectedImageUri,
+                                contentDescription = "Selected Image",
+                                contentScale = ContentScale.Crop,
+                                modifier = Modifier.fillMaxSize()
+                            )
+                        } else {
+                            Icon(
+                                imageVector = Icons.Default.AddPhotoAlternate,
+                                contentDescription = "Pick Image",
+                                tint = Color.DarkGray,
+                                modifier = Modifier.size(32.dp)
+                            )
+                        }
+                    }
+
+                    Column(modifier = Modifier.weight(1f)) {
+                        Button(
+                            onClick = onPickImage,
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.AddPhotoAlternate,
+                                contentDescription = null,
+                                modifier = Modifier.size(18.dp)
+                            )
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Text(if (selectedImageUri == null) "Select Image from Gallery" else "Change Image")
+                        }
+                        Text(
+                            text = "Saved in internal private storage so the media URI never expires.",
+                            fontSize = 11.sp,
+                            color = Color.Gray
                         )
                     }
                 }
 
-                Column(modifier = Modifier.weight(1f)) {
-                    Button(
-                        onClick = onPickImage,
+                // Multi-line Caption Input
+                OutlinedTextField(
+                    value = captionText,
+                    onValueChange = onCaptionChange,
+                    label = { Text("Message Caption") },
+                    placeholder = { Text("Write your promotional or response caption here...") },
+                    minLines = 3,
+                    maxLines = 6,
+                    modifier = Modifier.fillMaxWidth()
+                )
+
+                if (selectedTabIndex == 0) {
+                    // =========================================================
+                    // TAB 1: TIME SCHEDULER INPUTS
+                    // =========================================================
+                    GroupNameInputRow(
+                        targetGroupName = targetGroupName,
+                        targetGroupJid = targetGroupJid,
+                        onTargetGroupNameChange = onTargetGroupNameChange,
+                        onSyncGroupsClick = onSyncGroupsClick
+                    )
+
+                    OutlinedButton(
+                        onClick = {
+                            val cal = Calendar.getInstance().apply {
+                                timeInMillis = maxOf(scheduledTimeMillis, System.currentTimeMillis())
+                            }
+                            DatePickerDialog(
+                                context,
+                                { _, year, month, dayOfMonth ->
+                                    TimePickerDialog(
+                                        context,
+                                        { _, hourOfDay, minute ->
+                                            val chosenCal = Calendar.getInstance().apply {
+                                                set(Calendar.YEAR, year)
+                                                set(Calendar.MONTH, month)
+                                                set(Calendar.DAY_OF_MONTH, dayOfMonth)
+                                                set(Calendar.HOUR_OF_DAY, hourOfDay)
+                                                set(Calendar.MINUTE, minute)
+                                                set(Calendar.SECOND, 0)
+                                                set(Calendar.MILLISECOND, 0)
+                                            }
+                                            onScheduledTimeChange(chosenCal.timeInMillis)
+                                        },
+                                        cal.get(Calendar.HOUR_OF_DAY),
+                                        cal.get(Calendar.MINUTE),
+                                        false
+                                    ).show()
+                                },
+                                cal.get(Calendar.YEAR),
+                                cal.get(Calendar.MONTH),
+                                cal.get(Calendar.DAY_OF_MONTH)
+                            ).show()
+                        },
                         modifier = Modifier.fillMaxWidth()
                     ) {
+                        Icon(imageVector = Icons.Default.Schedule, contentDescription = null)
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text("Trigger Time: ${dateFormat.format(Date(scheduledTimeMillis))}")
+                    }
+
+                    Button(
+                        onClick = onScheduleTimeSubmit,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(48.dp),
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = MaterialTheme.colorScheme.primary
+                        )
+                    ) {
+                        Text(
+                            text = "Schedule Hybrid WhatsApp Task",
+                            fontWeight = FontWeight.Bold,
+                            fontSize = 15.sp
+                        )
+                    }
+                } else {
+                    // =========================================================
+                    // TAB 2: AUTO-POST ON GROUP ACTIVITY INPUTS
+                    // =========================================================
+                    Text(
+                        text = "Group Trigger Mode",
+                        fontWeight = FontWeight.SemiBold,
+                        fontSize = 14.sp
+                    )
+
+                    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clip(RoundedCornerShape(8.dp))
+                                .clickable { onMatchAllGroupsChange(false) }
+                                .padding(vertical = 4.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            RadioButton(
+                                selected = !matchAllGroups,
+                                onClick = { onMatchAllGroupsChange(false) }
+                            )
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Column {
+                                Text(
+                                    text = "Specific Group Name",
+                                    fontWeight = FontWeight.Medium,
+                                    fontSize = 14.sp
+                                )
+                                Text(
+                                    text = "Only auto-post when someone posts in the specified group (e.g. SLH Buy & Sell)",
+                                    fontSize = 11.sp,
+                                    color = Color.DarkGray
+                                )
+                            }
+                        }
+
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clip(RoundedCornerShape(8.dp))
+                                .clickable { onMatchAllGroupsChange(true) }
+                                .padding(vertical = 4.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            RadioButton(
+                                selected = matchAllGroups,
+                                onClick = { onMatchAllGroupsChange(true) }
+                            )
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Column {
+                                Text(
+                                    text = "Any WhatsApp Group (Reply wherever a post arrives)",
+                                    fontWeight = FontWeight.Medium,
+                                    fontSize = 14.sp
+                                )
+                                Text(
+                                    text = "Dynamically detects whichever group received a message and sends your post there",
+                                    fontSize = 11.sp,
+                                    color = Color.DarkGray
+                                )
+                            }
+                        }
+                    }
+
+                    if (!matchAllGroups) {
+                        GroupNameInputRow(
+                            targetGroupName = targetGroupName,
+                            targetGroupJid = targetGroupJid,
+                            onTargetGroupNameChange = onTargetGroupNameChange,
+                            onSyncGroupsClick = onSyncGroupsClick
+                        )
+                    }
+
+                    // Cooldown Selector Chips
+                    Text(
+                        text = "Per-Group Anti-Spam Cooldown",
+                        fontWeight = FontWeight.SemiBold,
+                        fontSize = 14.sp
+                    )
+
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .horizontalScroll(rememberScrollState()),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        COOLDOWN_OPTIONS.forEach { option ->
+                            val isSelected = selectedCooldownMillis == option.durationMillis
+                            FilterChip(
+                                selected = isSelected,
+                                onClick = { onCooldownChange(option.durationMillis) },
+                                label = {
+                                    Text(
+                                        text = option.label,
+                                        fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal
+                                    )
+                                },
+                                colors = FilterChipDefaults.filterChipColors(
+                                    selectedContainerColor = MaterialTheme.colorScheme.primary.copy(alpha = 0.15f),
+                                    selectedLabelColor = MaterialTheme.colorScheme.primary
+                                )
+                            )
+                        }
+                    }
+
+                    Button(
+                        onClick = onActivateAutoRuleSubmit,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(48.dp),
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = Color(0xFF128C7E)
+                        )
+                    ) {
                         Icon(
-                            imageVector = Icons.Default.AddPhotoAlternate,
+                            imageVector = Icons.Default.AutoAwesome,
                             contentDescription = null,
                             modifier = Modifier.size(18.dp)
                         )
                         Spacer(modifier = Modifier.width(8.dp))
-                        Text(if (selectedImageUri == null) "Select Image from Gallery" else "Change Image")
+                        Text(
+                            text = "Activate Auto-Responder Rule",
+                            fontWeight = FontWeight.Bold,
+                            fontSize = 15.sp
+                        )
                     }
-                    Text(
-                        text = "Image is immediately copied to private internal storage so its URI never expires.",
-                        fontSize = 11.sp,
-                        color = Color.Gray
-                    )
                 }
             }
+        }
+    }
+}
 
-            // Target Group Name + Sync from Node.js Button
+@Composable
+private fun GroupNameInputRow(
+    targetGroupName: String,
+    targetGroupJid: String?,
+    onTargetGroupNameChange: (String) -> Unit,
+    onSyncGroupsClick: () -> Unit
+) {
+    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            OutlinedTextField(
+                value = targetGroupName,
+                onValueChange = onTargetGroupNameChange,
+                label = { Text("Target WhatsApp Group Name") },
+                placeholder = { Text("e.g. SLH Buy & Sell") },
+                singleLine = true,
+                modifier = Modifier.weight(1f)
+            )
+            OutlinedButton(
+                onClick = onSyncGroupsClick,
+                contentPadding = PaddingValues(horizontal = 12.dp, vertical = 14.dp)
+            ) {
+                Icon(
+                    imageVector = Icons.Default.Groups,
+                    contentDescription = "Sync Groups",
+                    modifier = Modifier.size(18.dp)
+                )
+                Spacer(modifier = Modifier.width(4.dp))
+                Text("Sync", fontSize = 12.sp)
+            }
+        }
+
+        if (!targetGroupJid.isNullOrBlank()) {
+            Text(
+                text = "Linked Group JID: $targetGroupJid",
+                fontSize = 11.sp,
+                color = Color(0xFF075E54),
+                fontWeight = FontWeight.Medium
+            )
+        }
+    }
+}
+
+@Composable
+private fun AutoReplyRuleItemCard(
+    rule: AutoReplyRuleEntity,
+    onToggleEnabled: (Boolean) -> Unit,
+    onDelete: () -> Unit
+) {
+    val cooldownLabel = remember(rule.cooldownMillis) {
+        COOLDOWN_OPTIONS.firstOrNull { it.durationMillis == rule.cooldownMillis }?.label
+            ?: "${rule.cooldownMillis / 1000L}s"
+    }
+
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(containerColor = Color.White),
+        elevation = CardDefaults.cardElevation(defaultElevation = 1.dp)
+    ) {
+        Column(
+            modifier = Modifier.padding(14.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
             Row(
                 modifier = Modifier.fillMaxWidth(),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
             ) {
-                OutlinedTextField(
-                    value = targetGroupName,
-                    onValueChange = onTargetGroupNameChange,
-                    label = { Text("Target WhatsApp Group Name") },
-                    placeholder = { Text("e.g. Marketing Updates") },
-                    singleLine = true,
-                    modifier = Modifier.weight(1f)
-                )
-                OutlinedButton(
-                    onClick = onSyncGroupsClick,
-                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 14.dp)
-                ) {
-                    Icon(
-                        imageVector = Icons.Default.Groups,
-                        contentDescription = "Sync Groups",
-                        modifier = Modifier.size(18.dp)
-                    )
-                    Spacer(modifier = Modifier.width(4.dp))
-                    Text("Sync", fontSize = 12.sp)
-                }
-            }
-
-            if (!targetGroupJid.isNullOrBlank()) {
-                Text(
-                    text = "Linked Group JID: $targetGroupJid",
-                    fontSize = 11.sp,
-                    color = Color(0xFF075E54),
-                    fontWeight = FontWeight.Medium
-                )
-            }
-
-            // Multi-line Caption Input
-            OutlinedTextField(
-                value = captionText,
-                onValueChange = onCaptionChange,
-                label = { Text("Message Caption") },
-                placeholder = { Text("Write your caption here...") },
-                minLines = 3,
-                maxLines = 6,
-                modifier = Modifier.fillMaxWidth()
-            )
-
-            // Exact Date & Time Picker Button
-            OutlinedButton(
-                onClick = {
-                    val cal = Calendar.getInstance().apply {
-                        timeInMillis = maxOf(scheduledTimeMillis, System.currentTimeMillis())
-                    }
-                    DatePickerDialog(
-                        context,
-                        { _, year, month, dayOfMonth ->
-                            TimePickerDialog(
-                                context,
-                                { _, hourOfDay, minute ->
-                                    val chosenCal = Calendar.getInstance().apply {
-                                        set(Calendar.YEAR, year)
-                                        set(Calendar.MONTH, month)
-                                        set(Calendar.DAY_OF_MONTH, dayOfMonth)
-                                        set(Calendar.HOUR_OF_DAY, hourOfDay)
-                                        set(Calendar.MINUTE, minute)
-                                        set(Calendar.SECOND, 0)
-                                        set(Calendar.MILLISECOND, 0)
-                                    }
-                                    onScheduledTimeChange(chosenCal.timeInMillis)
-                                },
-                                cal.get(Calendar.HOUR_OF_DAY),
-                                cal.get(Calendar.MINUTE),
-                                false
-                            ).show()
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = if (rule.matchAllGroups) {
+                            "Any WhatsApp Group (All Groups)"
+                        } else {
+                            rule.targetGroupName
                         },
-                        cal.get(Calendar.YEAR),
-                        cal.get(Calendar.MONTH),
-                        cal.get(Calendar.DAY_OF_MONTH)
-                    ).show()
-                },
-                modifier = Modifier.fillMaxWidth()
-            ) {
-                Icon(imageVector = Icons.Default.Schedule, contentDescription = null)
-                Spacer(modifier = Modifier.width(8.dp))
-                Text("Trigger Time: ${dateFormat.format(Date(scheduledTimeMillis))}")
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 15.sp,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                    Text(
+                        text = "Cooldown: $cooldownLabel • Sent ${rule.triggerCount} times",
+                        fontSize = 12.sp,
+                        color = Color(0xFF075E54),
+                        fontWeight = FontWeight.Medium
+                    )
+                }
+
+                Switch(
+                    checked = rule.isEnabled,
+                    onCheckedChange = onToggleEnabled
+                )
             }
 
-            // Submit Schedule Task Button
-            Button(
-                onClick = onScheduleSubmit,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(48.dp),
-                colors = ButtonDefaults.buttonColors(
-                    containerColor = MaterialTheme.colorScheme.primary
-                )
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(12.dp),
+                verticalAlignment = Alignment.CenterVertically
             ) {
-                Text(
-                    text = "Schedule Hybrid WhatsApp Task",
-                    fontWeight = FontWeight.Bold,
-                    fontSize = 15.sp
+                AsyncImage(
+                    model = File(rule.imageLocalPath),
+                    contentDescription = "Rule Thumbnail",
+                    contentScale = ContentScale.Crop,
+                    modifier = Modifier
+                        .size(60.dp)
+                        .clip(RoundedCornerShape(8.dp))
+                        .background(Color.LightGray)
                 )
+
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = rule.caption.ifBlank { "(No text caption)" },
+                        fontSize = 13.sp,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                    if (!rule.lastTriggeredGroup.isNullOrBlank()) {
+                        Spacer(modifier = Modifier.height(4.dp))
+                        Text(
+                            text = "Last triggered in: \"${rule.lastTriggeredGroup}\"",
+                            fontSize = 11.sp,
+                            color = Color.Gray
+                        )
+                    }
+                }
+
+                IconButton(onClick = onDelete) {
+                    Icon(
+                        imageVector = Icons.Default.Delete,
+                        contentDescription = "Delete Rule",
+                        tint = Color(0xFFD32F2F)
+                    )
+                }
             }
         }
     }
