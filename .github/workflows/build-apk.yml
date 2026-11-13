@@ -32,9 +32,9 @@ jobs:
         with:
           gradle-version: '8.7'
 
-      - name: Compile Debug and Release APKs
+      - name: Run Unit Tests & Compile Debug and Release APKs
         working-directory: ./android-app
-        run: gradle assembleDebug assembleRelease --stacktrace --info
+        run: gradle test assembleDebug assembleRelease --stacktrace --info
 
       - name: Upload Installable Debug APK
         uses: actions/upload-artifact@v4

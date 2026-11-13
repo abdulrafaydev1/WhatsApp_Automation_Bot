@@ -45,6 +45,10 @@ android {
         checkReleaseBuilds = false
     }
 
+    testOptions {
+        unitTests.isReturnDefaultValues = true
+    }
+
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
@@ -103,4 +107,8 @@ dependencies {
 
     // Coil for Image Preview in Jetpack Compose
     implementation("io.coil-kt:coil-compose:2.7.0")
+
+    // Unit Testing
+    testImplementation("junit:junit:4.13.2")
+    testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.8.1")
 }
