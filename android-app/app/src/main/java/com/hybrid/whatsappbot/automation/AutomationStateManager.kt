@@ -6,14 +6,15 @@ import kotlinx.coroutines.flow.asStateFlow
 import java.util.concurrent.atomic.AtomicReference
 
 /**
- * Strict State Machine states for Engine 1 (WhatsApp UI Accessibility Automation).
+ * 5-State Sequential State Machine for WhatsApp Two-Stage Media Share Automation.
  */
 enum class UiBotSubState {
     IDLE,
-    SEARCHING_GROUP,
-    SELECTING_GROUP,
-    FILLING_CAPTION_AND_SENDING,
-    COMPLETED
+    STATE_1_CLICK_SEARCH,
+    STATE_2_TYPE_QUERY,
+    STATE_3_SELECT_GROUP,
+    STATE_4_PICKER_OR_PREVIEW_SEND,
+    STATE_5_DONE
 }
 
 data class ActiveAutomationSession(
@@ -22,17 +23,13 @@ data class ActiveAutomationSession(
     val caption: String,
     val expiryTimestampMillis: Long,
     val subState: UiBotSubState,
-    val lastActionTimestampMillis: Long = System.currentTimeMillis()
+    val stateEnteredAtMillis: Long = System.currentTimeMillis(),
+    val attemptCountInState: Int = 0,
+    val pickerFabClicked: Boolean = false
 )
 
 /**
- * Thread-safe singleton managing the 20-second automation lock window.
- *
- * CRITICAL GUARDRAIL:
- * WhatsAppAccessibilityService ignores 100% of events unless:
- * 1. An ActiveAutomationSession exists
- * 2. System.currentTimeMillis() < session.expiryTimestampMillis
- * 3. session.subState != UiBotSubState.COMPLETED
+ * Thread-safe singleton managing the 20-second automation lock window and 5-step state machine.
  */
 object AutomationStateManager {
 
@@ -58,21 +55,22 @@ object AutomationStateManager {
             targetGroupName = targetGroupName.trim(),
             caption = caption,
             expiryTimestampMillis = now + windowDurationMs,
-            subState = UiBotSubState.SEARCHING_GROUP,
-            lastActionTimestampMillis = now
+            subState = UiBotSubState.STATE_1_CLICK_SEARCH,
+            stateEnteredAtMillis = now,
+            attemptCountInState = 0,
+            pickerFabClicked = false
         )
         sessionRef.set(session)
         _sessionFlow.value = session
     }
 
     /**
-     * Returns the current session ONLY if it is active, not expired, and not completed.
-     * Automatically clears expired sessions to guarantee normal user WhatsApp usage is unaffected.
+     * Returns the current session ONLY if it is active, not expired, and not in STATE_5_DONE.
      */
     fun getValidSession(): ActiveAutomationSession? {
         val current = sessionRef.get() ?: return null
         val now = System.currentTimeMillis()
-        if (now >= current.expiryTimestampMillis || current.subState == UiBotSubState.COMPLETED) {
+        if (now >= current.expiryTimestampMillis || current.subState == UiBotSubState.STATE_5_DONE) {
             if (now >= current.expiryTimestampMillis) {
                 clearSession()
             }
@@ -81,22 +79,26 @@ object AutomationStateManager {
         return current
     }
 
-    val isTaskActive: Boolean
-        get() = getValidSession() != null
+    fun isTaskActive(): Boolean = getValidSession() != null
 
     /**
-     * Transitions from SEARCHING_GROUP -> SELECTING_GROUP once the target group name
-     * has been injected into WhatsApp's search bar.
+     * Transitions the active session to a new sequential state and resets attempt counters.
      */
-    fun transitionToSelectingGroup(taskId: String): Boolean {
+    fun transitionToState(
+        taskId: String,
+        newState: UiBotSubState,
+        pickerFabClicked: Boolean = false
+    ): Boolean {
         while (true) {
             val current = getValidSession() ?: return false
             if (current.taskId != taskId) return false
-            if (current.subState != UiBotSubState.SEARCHING_GROUP) return false
+            if (current.subState == UiBotSubState.STATE_5_DONE) return false
 
             val updated = current.copy(
-                subState = UiBotSubState.SELECTING_GROUP,
-                lastActionTimestampMillis = System.currentTimeMillis()
+                subState = newState,
+                stateEnteredAtMillis = System.currentTimeMillis(),
+                attemptCountInState = 0,
+                pickerFabClicked = pickerFabClicked
             )
             if (sessionRef.compareAndSet(current, updated)) {
                 _sessionFlow.value = updated
@@ -106,44 +108,40 @@ object AutomationStateManager {
     }
 
     /**
-     * Transitions from SELECTING_GROUP -> FILLING_CAPTION_AND_SENDING once the target
-     * group row in the picker has been clicked.
+     * Increments the attempt count within the current state so subsequent ticks can
+     * escalate from parent ACTION_CLICK to hardware GestureDescription coordinate tap.
      */
-    fun transitionToCaptionAndSend(taskId: String): Boolean {
+    fun incrementAttempt(taskId: String, markPickerFabClicked: Boolean? = null): Int {
         while (true) {
-            val current = getValidSession() ?: return false
-            if (current.taskId != taskId) return false
-            if (current.subState != UiBotSubState.SELECTING_GROUP &&
-                current.subState != UiBotSubState.SEARCHING_GROUP
-            ) {
-                return false
-            }
+            val current = getValidSession() ?: return 0
+            if (current.taskId != taskId) return 0
 
+            val nextAttempt = current.attemptCountInState + 1
             val updated = current.copy(
-                subState = UiBotSubState.FILLING_CAPTION_AND_SENDING,
-                lastActionTimestampMillis = System.currentTimeMillis()
+                attemptCountInState = nextAttempt,
+                pickerFabClicked = markPickerFabClicked ?: current.pickerFabClicked
             )
             if (sessionRef.compareAndSet(current, updated)) {
                 _sessionFlow.value = updated
-                return true
+                return nextAttempt
             }
         }
     }
 
     /**
      * CRITICAL ANTI-LOOP LOCK:
-     * Atomically transitions subState to COMPLETED *before* the Send button click is dispatched.
-     * Guarantees the Send button can never be clicked more than once per task.
+     * Atomically transitions subState to STATE_5_DONE *before* the final Media Preview Send
+     * button click is executed, guaranteeing the message is never sent twice.
      */
     fun tryLockForFinalSendClick(taskId: String): Boolean {
         while (true) {
             val current = getValidSession() ?: return false
             if (current.taskId != taskId) return false
-            if (current.subState == UiBotSubState.COMPLETED) return false
+            if (current.subState == UiBotSubState.STATE_5_DONE) return false
 
             val updated = current.copy(
-                subState = UiBotSubState.COMPLETED,
-                lastActionTimestampMillis = System.currentTimeMillis()
+                subState = UiBotSubState.STATE_5_DONE,
+                stateEnteredAtMillis = System.currentTimeMillis()
             )
             if (sessionRef.compareAndSet(current, updated)) {
                 _sessionFlow.value = updated
