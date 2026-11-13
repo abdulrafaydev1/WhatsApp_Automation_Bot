@@ -1,0 +1,5 @@
+<resources>
+    <string name="app_name">Hybrid WhatsApp Scheduler</string>
+    <string name="accessibility_service_label">WhatsApp Hybrid UI Scheduler</string>
+    <string name="accessibility_service_description">Automates sending scheduled media and captions to WhatsApp groups ONLY during the 20-second active window of a scheduled task when the phone is unlocked.</string>
+</resources>
