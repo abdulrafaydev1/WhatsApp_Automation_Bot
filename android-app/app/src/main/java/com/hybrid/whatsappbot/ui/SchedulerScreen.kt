@@ -370,7 +370,8 @@ fun SchedulerScreen(viewModel: SchedulerViewModel) {
     }
 
     // QR Code Viewer Modal Dialog for Linking Node.js Background Bot
-    if (showQrDialog && !serverUiState.qrCodeBase64.isNullOrBlank()) {
+    val qrCodeBase64 = serverUiState.qrCodeBase64
+    if (showQrDialog && !qrCodeBase64.isNullOrBlank()) {
         AlertDialog(
             onDismissRequest = { showQrDialog = false },
             title = { Text("Link Node.js Background Bot") },
@@ -379,8 +380,8 @@ fun SchedulerScreen(viewModel: SchedulerViewModel) {
                     modifier = Modifier.fillMaxWidth(),
                     horizontalAlignment = Alignment.CenterHorizontally
                 ) {
-                    val bitmap = remember(serverUiState.qrCodeBase64) {
-                        decodeDataUrlBase64ToBitmap(serverUiState.qrCodeBase64!!)
+                    val bitmap = remember(qrCodeBase64) {
+                        decodeDataUrlBase64ToBitmap(qrCodeBase64)
                     }
                     if (bitmap != null) {
                         Image(
@@ -510,9 +511,10 @@ private fun SystemReadinessCard(
                 }
             }
 
-            if (!serverUiState.statusBannerMessage.isNullOrBlank()) {
+            val bannerMessage = serverUiState.statusBannerMessage
+            if (!bannerMessage.isNullOrBlank()) {
                 Text(
-                    text = serverUiState.statusBannerMessage,
+                    text = bannerMessage,
                     fontSize = 12.sp,
                     color = if (isServerConnected) Color(0xFF1B5E20) else Color(0xFFB71C1C)
                 )

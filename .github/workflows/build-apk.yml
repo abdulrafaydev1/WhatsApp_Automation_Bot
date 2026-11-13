@@ -17,13 +17,15 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Setup JDK 17 (Temurin)
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: 'temurin'
           java-version: '17'
 
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
+        with:
+          packages: 'platform-tools'
 
       - name: Setup Gradle 8.7
         uses: gradle/actions/setup-gradle@v4
@@ -32,7 +34,7 @@ jobs:
 
       - name: Compile Debug and Release APKs
         working-directory: ./android-app
-        run: gradle assembleDebug assembleRelease --stacktrace
+        run: gradle assembleDebug assembleRelease --stacktrace --info
 
       - name: Upload Installable Debug APK
         uses: actions/upload-artifact@v4
