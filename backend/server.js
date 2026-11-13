@@ -50,6 +50,8 @@ const inFlightTaskIds = new Set();
 // Cooldown & Anti-Self-Loop tracking for 24/7 Baileys Auto-Responder Rules
 const autoRulesMap = new Map(); // ruleId -> rule object
 const autoCooldownMap = new Map(); // `${ruleId}_${remoteJid}` -> timestampMs
+const pendingGroupTimers = new Set(); // remoteJid -> active 5s delay lock
+const lastSentTimestamps = new Map(); // remoteJid -> timestampMs
 const recentBotGroupSends = new Map(); // remoteJid -> timestampMs
 
 function loadProcessedTasks() {
@@ -286,6 +288,12 @@ async function handleIncomingGroupMessageForAutoRules(msg) {
     return;
   }
 
+  // Burst debounce guard: ignore if a 5-second delay timer is already pending for this group
+  if (pendingGroupTimers.has(remoteJid)) {
+    logger.debug({ remoteJid }, 'Group already has a pending 5-second auto-reply timer. Ignoring burst message.');
+    return;
+  }
+
   const enabledRules = Array.from(autoRulesMap.values()).filter(
     (r) => r.isEnabled && r.serverAutoExecute !== false
   );
@@ -310,7 +318,10 @@ async function handleIncomingGroupMessageForAutoRules(msg) {
 
     // Check per-rule, per-group cooldown
     const cooldownKey = `${rule.ruleId}_${remoteJid}`;
-    const lastTriggered = autoCooldownMap.get(cooldownKey) || 0;
+    const lastTriggered = Math.max(
+      autoCooldownMap.get(cooldownKey) || 0,
+      lastSentTimestamps.get(remoteJid) || 0
+    );
     const cooldownMs = Number(rule.cooldownMillis) || 120000;
 
     if (now - lastTriggered < cooldownMs) {
@@ -326,26 +337,42 @@ async function handleIncomingGroupMessageForAutoRules(msg) {
       continue;
     }
 
-    // Lock cooldown & anti-loop timestamps immediately before sending
+    // Lock pending timer & cooldown timestamps BEFORE starting the 5-second wait
+    pendingGroupTimers.add(remoteJid);
     autoCooldownMap.set(cooldownKey, now);
-    recentBotGroupSends.set(remoteJid, now);
+    lastSentTimestamps.set(remoteJid, now);
 
-    const imageBuffer = fs.readFileSync(rule.imageFilePath);
-    await sock.sendMessage(remoteJid, {
-      image: imageBuffer,
-      mimetype: rule.mimeType || 'image/jpeg',
-      caption: rule.caption || ''
-    });
+    try {
+      logger.info(
+        { ruleId: rule.ruleId, remoteJid, groupSubject },
+        `Group activity detected in [${groupSubject || remoteJid}]. Waiting 5 seconds before sending...`
+      );
 
-    rule.triggerCount = (Number(rule.triggerCount) || 0) + 1;
-    rule.lastTriggeredAtMillis = now;
-    rule.lastTriggeredGroup = groupSubject || remoteJid;
-    saveAutoRules();
+      // Wait 5 seconds (5000ms) before triggering the reply post
+      await new Promise((resolve) => setTimeout(resolve, 5000));
 
-    logger.info(
-      { ruleId: rule.ruleId, remoteJid, groupSubject },
-      'Auto-Responder Rule triggered and delivered group media post via Baileys!'
-    );
+      recentBotGroupSends.set(remoteJid, Date.now());
+      const imageBuffer = fs.readFileSync(rule.imageFilePath);
+      await sock.sendMessage(remoteJid, {
+        image: imageBuffer,
+        mimetype: rule.mimeType || 'image/jpeg',
+        caption: rule.caption || ''
+      });
+
+      rule.triggerCount = (Number(rule.triggerCount) || 0) + 1;
+      rule.lastTriggeredAtMillis = Date.now();
+      rule.lastTriggeredGroup = groupSubject || remoteJid;
+      saveAutoRules();
+
+      logger.info(
+        { ruleId: rule.ruleId, remoteJid, groupSubject },
+        'Auto-Responder Rule triggered after 5s smart delay and delivered group media post via Baileys!'
+      );
+    } finally {
+      pendingGroupTimers.delete(remoteJid);
+      recentBotGroupSends.set(remoteJid, Date.now());
+    }
+    break;
   }
 }
 

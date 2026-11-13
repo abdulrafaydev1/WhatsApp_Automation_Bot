@@ -780,6 +780,33 @@ private fun DualModeCreationCard(
                     fontWeight = FontWeight.Bold
                 )
 
+                if (selectedTabIndex == 1) {
+                    Surface(
+                        color = Color(0xFFE0F2F1),
+                        shape = RoundedCornerShape(8.dp),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Schedule,
+                                contentDescription = null,
+                                tint = Color(0xFF00695C),
+                                modifier = Modifier.size(16.dp)
+                            )
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Text(
+                                text = "Smart Trigger Delay: 5 Seconds (Waits 5s after incoming group post before sending)",
+                                fontSize = 12.sp,
+                                fontWeight = FontWeight.SemiBold,
+                                color = Color(0xFF00695C)
+                            )
+                        }
+                    }
+                }
+
                 // Shared Image Picker + Thumbnail Preview
                 Row(
                     modifier = Modifier.fillMaxWidth(),
@@ -1127,7 +1154,7 @@ private fun AutoReplyRuleItemCard(
                         overflow = TextOverflow.Ellipsis
                     )
                     Text(
-                        text = "Cooldown: $cooldownLabel • Sent ${rule.triggerCount} times",
+                        text = "Smart Trigger Delay: 5s • Cooldown: $cooldownLabel • Sent ${rule.triggerCount} times",
                         fontSize = 12.sp,
                         color = Color(0xFF075E54),
                         fontWeight = FontWeight.Medium

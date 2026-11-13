@@ -1,6 +1,9 @@
 package com.hybrid.whatsappbot.service
 
+import android.app.KeyguardManager
 import android.app.Notification
+import android.content.Context
+import android.os.PowerManager
 import android.service.notification.NotificationListenerService
 import android.service.notification.StatusBarNotification
 import android.util.Log
@@ -13,14 +16,18 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 import java.io.File
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 
 class WhatsAppNotificationListener : NotificationListenerService() {
 
-    private val listenerScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
 
     override fun onNotificationPosted(sbn: StatusBarNotification?) {
         if (sbn == null) return
@@ -71,9 +78,9 @@ class WhatsAppNotificationListener : NotificationListenerService() {
             return
         }
 
-        listenerScope.launch {
+        serviceScope.launch {
             try {
-                evaluateAndTriggerAutoRules(
+                evaluateAndScheduleFiveSecondDelayedPost(
                     detectedGroupName = detectedGroupName,
                     incomingSnippet = messageText ?: ""
                 )
@@ -83,12 +90,19 @@ class WhatsAppNotificationListener : NotificationListenerService() {
         }
     }
 
-    private suspend fun evaluateAndTriggerAutoRules(
+    private suspend fun evaluateAndScheduleFiveSecondDelayedPost(
         detectedGroupName: String,
         incomingSnippet: String
     ) {
-        // Re-check active/recent automation inside coroutine
         if (AutomationStateManager.wasRecentlyActive(15_000L)) {
+            return
+        }
+
+        val groupKey = detectedGroupName.trim().lowercase()
+
+        // 1. Pre-Delay Pending Lock Check: Ignore burst messages while 5s timer is already active
+        if (pendingGroupJobs[groupKey] == true) {
+            Log.d(TAG, "Group '$detectedGroupName' already has a pending 5-second auto-reply job. Ignoring burst message.")
             return
         }
 
@@ -96,12 +110,14 @@ class WhatsAppNotificationListener : NotificationListenerService() {
         val ruleDao = db.autoReplyRuleDao()
         val taskDao = db.taskDao()
 
-        val enabledRules = ruleDao.getEnabledRules()
+        val enabledRules = withContext(Dispatchers.IO) {
+            ruleDao.getEnabledRules()
+        }
         if (enabledRules.isEmpty()) return
 
         val now = System.currentTimeMillis()
 
-        for (rule in enabledRules) {
+        val matchedRule = enabledRules.firstOrNull { rule ->
             val isMatch = if (rule.matchAllGroups) {
                 true
             } else {
@@ -112,12 +128,10 @@ class WhatsAppNotificationListener : NotificationListenerService() {
                         target.contains(detectedGroupName, ignoreCase = true)
                     )
             }
+            if (!isMatch) return@firstOrNull false
 
-            if (!isMatch) continue
-
-            // Per-Rule + Per-Group Cooldown Check (in-memory + Room DB fallback)
-            val cooldownKey = "${rule.ruleId}_${detectedGroupName.lowercase()}"
-            val inMemoryLast = lastTriggeredMap[cooldownKey] ?: 0L
+            val cooldownKey = "${rule.ruleId}_$groupKey"
+            val inMemoryLast = lastTriggeredMap[cooldownKey] ?: lastTriggeredMap[groupKey] ?: 0L
             val dbLast = if (!rule.matchAllGroups ||
                 rule.lastTriggeredGroup.equals(detectedGroupName, ignoreCase = true)
             ) {
@@ -131,64 +145,104 @@ class WhatsAppNotificationListener : NotificationListenerService() {
                 val remainingSec = (rule.cooldownMillis - (now - effectiveLastTriggered)) / 1000L
                 Log.d(
                     TAG,
-                    "Auto-Rule ${rule.ruleId} matched group '$detectedGroupName', " +
+                    "Auto-Rule ${rule.ruleId} matched '$detectedGroupName', " +
                         "but cooldown active (${remainingSec}s remaining)."
                 )
-                continue
+                return@firstOrNull false
             }
 
             val imageFile = File(rule.imageLocalPath)
-            if (!imageFile.exists() || imageFile.length() == 0L) {
-                Log.w(TAG, "Auto-Rule ${rule.ruleId} image missing at ${rule.imageLocalPath}")
-                continue
-            }
+            imageFile.exists() && imageFile.length() > 0L
+        } ?: return
 
-            // Lock cooldown & anti-self-trigger timestamps immediately
-            lastTriggeredMap[cooldownKey] = now
-            AutomationStateManager.markBotActivityNow()
+        // =====================================================================
+        // STEP 1: Lock pendingGroupJobs & Cooldown BEFORE the 5-Second Delay
+        // =====================================================================
+        val cooldownKey = "${matchedRule.ruleId}_$groupKey"
+        if (pendingGroupJobs.putIfAbsent(groupKey, true) == true) {
+            return
+        }
+        lastTriggeredMap[groupKey] = now
+        lastTriggeredMap[cooldownKey] = now
+
+        val targetGroupToSend = if (matchedRule.matchAllGroups) {
+            detectedGroupName
+        } else {
+            matchedRule.targetGroupName.ifBlank { detectedGroupName }
+        }
+        val targetJidToSend = if (matchedRule.matchAllGroups) null else matchedRule.targetGroupJid
+
+        val generatedTaskId = "auto_${UUID.randomUUID()}"
+        val previewSnippet = incomingSnippet.take(36).ifBlank { "Group post" }
+
+        withContext(Dispatchers.IO) {
             ruleDao.recordRuleTriggered(
-                ruleId = rule.ruleId,
+                ruleId = matchedRule.ruleId,
                 triggeredAtMillis = now,
                 triggeredGroup = detectedGroupName
             )
-
-            // Resolve the target group name & JID to dispatch into
-            val targetGroupToSend = if (rule.matchAllGroups) {
-                detectedGroupName
-            } else {
-                rule.targetGroupName.ifBlank { detectedGroupName }
-            }
-            val targetJidToSend = if (rule.matchAllGroups) null else rule.targetGroupJid
-
-            val generatedTaskId = "auto_${UUID.randomUUID()}"
-            val previewSnippet = incomingSnippet.take(36).ifBlank { "Group post" }
-
             val autoTask = ScheduledTaskEntity(
                 taskId = generatedTaskId,
-                imageLocalPath = rule.imageLocalPath,
-                caption = rule.caption,
+                imageLocalPath = matchedRule.imageLocalPath,
+                caption = matchedRule.caption,
                 targetGroupName = targetGroupToSend,
                 targetGroupJid = targetJidToSend,
-                scheduledTimeMillis = now,
+                scheduledTimeMillis = now + SMART_DELAY_MS,
                 status = TaskStatus.PENDING,
-                executionLog = "Auto-Responder triggered by post in \"$detectedGroupName\" ($previewSnippet)"
+                executionLog = "Group activity detected in [$detectedGroupName] ($previewSnippet). Waiting 5 seconds before sending..."
             )
-
             taskDao.upsertTask(autoTask)
+        }
 
-            Log.i(
-                TAG,
-                "Auto-Responder Rule ${rule.ruleId} triggered for group '$targetGroupToSend'! " +
-                    "Dispatching taskId=$generatedTaskId via Smart State Detector..."
-            )
+        Log.i(TAG, "Group activity detected in [$detectedGroupName]. Waiting 5 seconds before sending...")
 
-            // Dispatch immediately through AlarmReceiver's Smart State Detector:
-            // - Unlocked + Screen ON -> Engine 1 (WhatsAppAccessibilityService UI Bot + 15s Watchdog)
-            // - Locked or Screen OFF -> Engine 2 (ExecutionForegroundService -> Node.js Baileys Bot)
-            AlarmSchedulerHelper.triggerTaskImmediately(applicationContext, generatedTaskId)
+        try {
+            // Wait exactly 5 seconds (5000ms) before triggering the reply post
+            delay(SMART_DELAY_MS)
 
-            // Only trigger one rule per notification event to avoid colliding UI intents
-            break
+            // =================================================================
+            // STEP 2: Acquire Sequential Execution Mutex & Re-Evaluate Lock State
+            // =================================================================
+            executionMutex.withLock {
+                // If another UI automation task is currently running, wait up to 15s + 1.5s buffer
+                var waitTicks = 0
+                while (AutomationStateManager.isTaskActive() && waitTicks < 30) {
+                    delay(500L)
+                    waitTicks++
+                }
+                if (waitTicks > 0) {
+                    delay(1_500L)
+                }
+
+                // Re-evaluate PowerManager.isInteractive & KeyguardManager.isKeyguardLocked right now
+                val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
+                val keyguardManager = getSystemService(Context.KEYGUARD_SERVICE) as KeyguardManager
+                val isUnlockedAndScreenOn = powerManager.isInteractive && !keyguardManager.isKeyguardLocked
+
+                Log.i(
+                    TAG,
+                    "5-second delay completed for [$detectedGroupName]. " +
+                        "Re-evaluated state: unlockedAndScreenOn=$isUnlockedAndScreenOn. Dispatching taskId=$generatedTaskId..."
+                )
+
+                // Set 15-second self-post ignore window before dispatching
+                AutomationStateManager.markBotActivityNow()
+                AlarmSchedulerHelper.triggerTaskImmediately(applicationContext, generatedTaskId)
+
+                // If UI automation started, wait inside the mutex until it finishes so queued groups never collide
+                if (isUnlockedAndScreenOn) {
+                    delay(800L)
+                    var uiRunTicks = 0
+                    while (AutomationStateManager.isTaskActive() && uiRunTicks < 40) {
+                        delay(500L)
+                        uiRunTicks++
+                    }
+                    delay(1_500L)
+                }
+            }
+        } finally {
+            pendingGroupJobs[groupKey] = false
+            AutomationStateManager.markBotActivityNow()
         }
     }
 
@@ -211,7 +265,6 @@ class WhatsAppNotificationListener : NotificationListenerService() {
             }
         }
 
-        // Remove trailing "(3 messages)" or "(5 new messages)" badges
         val withoutCountBadge = baseTitle.replace(
             Regex("""\s*\(\d+\s+[^)]*messages?\)\s*$""", RegexOption.IGNORE_CASE),
             ""
@@ -243,12 +296,16 @@ class WhatsAppNotificationListener : NotificationListenerService() {
     }
 
     override fun onDestroy() {
-        listenerScope.cancel()
+        serviceScope.cancel()
         super.onDestroy()
     }
 
     companion object {
         private const val TAG = "WANotifListener"
+        private const val SMART_DELAY_MS = 5_000L
+
+        private val pendingGroupJobs = ConcurrentHashMap<String, Boolean>()
         private val lastTriggeredMap = ConcurrentHashMap<String, Long>()
+        private val executionMutex = Mutex()
     }
 }
