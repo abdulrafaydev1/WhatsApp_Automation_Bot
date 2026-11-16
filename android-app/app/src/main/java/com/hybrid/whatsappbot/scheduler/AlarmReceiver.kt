@@ -112,12 +112,12 @@ class AlarmReceiver : BroadcastReceiver() {
                     logMessage = "Phone UNLOCKED & Screen ON -> Running Engine 1 (UI Bot) with 15s Fail-Safe Watchdog."
                 )
 
-                // 1. Lock the 20-second window in AutomationStateManager
+                // 1. Lock the 25-second window in AutomationStateManager
                 AutomationStateManager.activateSession(
                     taskId = task.taskId,
                     targetGroupName = task.targetGroupName,
                     caption = task.caption,
-                    windowDurationMs = 20_000L
+                    windowDurationMs = 25_000L
                 )
 
                 // 2. Start 15-second fail-safe Watchdog in ExecutionForegroundService

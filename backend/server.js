@@ -20,6 +20,7 @@ const PORT = process.env.PORT || 3000;
 const AUTH_DIR = path.join(__dirname, 'auth_info_baileys');
 const PROCESSED_TASKS_FILE = path.join(__dirname, 'processed_tasks.json');
 const AUTO_RULES_FILE = path.join(__dirname, 'auto_rules.json');
+const LAST_SENT_KEYS_FILE = path.join(__dirname, 'last_sent_keys.json');
 const AUTO_MEDIA_DIR = path.join(__dirname, 'auto_rule_media');
 
 if (!fs.existsSync(AUTO_MEDIA_DIR)) {
@@ -53,6 +54,7 @@ const autoCooldownMap = new Map(); // `${ruleId}_${remoteJid}` -> timestampMs
 const pendingGroupTimers = new Set(); // remoteJid -> active 5s delay lock
 const lastSentTimestamps = new Map(); // remoteJid -> timestampMs
 const recentBotGroupSends = new Map(); // remoteJid -> timestampMs
+const lastSentMessageKeys = new Map(); // groupJid (@g.us) -> Baileys msg.key ({ remoteJid, fromMe, id })
 
 function loadProcessedTasks() {
   try {
@@ -105,8 +107,72 @@ function saveAutoRules() {
   }
 }
 
+function loadLastSentKeys() {
+  try {
+    if (fs.existsSync(LAST_SENT_KEYS_FILE)) {
+      const raw = fs.readFileSync(LAST_SENT_KEYS_FILE, 'utf-8');
+      const obj = JSON.parse(raw);
+      if (obj && typeof obj === 'object') {
+        Object.entries(obj).forEach(([groupJid, key]) => {
+          if (groupJid && key && key.id) {
+            lastSentMessageKeys.set(groupJid, key);
+          }
+        });
+      }
+    }
+  } catch (err) {
+    logger.warn({ err }, 'Could not load last_sent_keys.json, starting fresh.');
+  }
+}
+
+function saveLastSentKey(groupJid, messageKey) {
+  if (!groupJid || !messageKey || !messageKey.id) return;
+  lastSentMessageKeys.set(groupJid, messageKey);
+  try {
+    const plainObj = Object.fromEntries(lastSentMessageKeys.entries());
+    fs.writeFileSync(LAST_SENT_KEYS_FILE, JSON.stringify(plainObj, null, 2), 'utf-8');
+  } catch (err) {
+    logger.warn({ err }, 'Could not persist last_sent_keys.json');
+  }
+}
+
+/**
+ * Deletes the previous bot post in [groupJid] for everyone (if one exists),
+ * then sends the new media post and records its message key for the next send.
+ */
+async function sendGroupMediaWithAutoDeletePrevious(groupJid, imageBuffer, mimeType, caption) {
+  const previousKey = lastSentMessageKeys.get(groupJid);
+  if (previousKey && previousKey.id) {
+    try {
+      await sock.sendMessage(groupJid, { delete: previousKey });
+      logger.info(
+        { groupJid, deletedMessageId: previousKey.id },
+        'Auto-deleted previous bot post for everyone in group.'
+      );
+    } catch (delErr) {
+      logger.warn(
+        { delErr, groupJid, previousMessageId: previousKey.id },
+        'Failed to auto-delete previous bot post (proceeding with new send).'
+      );
+    }
+  }
+
+  const sentMsg = await sock.sendMessage(groupJid, {
+    image: imageBuffer,
+    mimetype: mimeType || 'image/jpeg',
+    caption: caption || ''
+  });
+
+  if (sentMsg && sentMsg.key) {
+    saveLastSentKey(groupJid, sentMsg.key);
+  }
+
+  return sentMsg;
+}
+
 loadProcessedTasks();
 loadAutoRules();
+loadLastSentKeys();
 
 // Global WhatsApp Connection State
 let sock = null;
@@ -353,11 +419,12 @@ async function handleIncomingGroupMessageForAutoRules(msg) {
 
       recentBotGroupSends.set(remoteJid, Date.now());
       const imageBuffer = fs.readFileSync(rule.imageFilePath);
-      await sock.sendMessage(remoteJid, {
-        image: imageBuffer,
-        mimetype: rule.mimeType || 'image/jpeg',
-        caption: rule.caption || ''
-      });
+      await sendGroupMediaWithAutoDeletePrevious(
+        remoteJid,
+        imageBuffer,
+        rule.mimeType || 'image/jpeg',
+        rule.caption || ''
+      );
 
       rule.triggerCount = (Number(rule.triggerCount) || 0) + 1;
       rule.lastTriggeredAtMillis = Date.now();
@@ -587,11 +654,12 @@ app.post('/api/v1/send-group-media', upload.single('image'), async (req, res) =>
       'Sending scheduled media message to WhatsApp group via Baileys...'
     );
 
-    const sendResult = await sock.sendMessage(resolvedJid, {
-      image: req.file.buffer,
-      mimetype: req.file.mimetype || 'image/jpeg',
-      caption: caption
-    });
+    const sendResult = await sendGroupMediaWithAutoDeletePrevious(
+      resolvedJid,
+      req.file.buffer,
+      req.file.mimetype || 'image/jpeg',
+      caption
+    );
 
     saveProcessedTask(taskId);
     inFlightTaskIds.delete(taskId);

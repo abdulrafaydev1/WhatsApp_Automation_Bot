@@ -7,6 +7,7 @@ backend/auth_info_baileys/
 backend/processed_tasks.json
 backend/auto_rules.json
 backend/auto_rule_media/
+backend/last_sent_keys.json
 
 # Android & Gradle Build Artifacts
 .gradle/

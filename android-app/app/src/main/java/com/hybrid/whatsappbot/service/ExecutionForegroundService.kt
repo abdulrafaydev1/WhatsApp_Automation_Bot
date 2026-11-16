@@ -205,6 +205,11 @@ class ExecutionForegroundService : Service() {
             val body = response.body()
             if (response.isSuccessful && body != null && body.success) {
                 AutomationStateManager.markBotActivityNow()
+                AutomationStateManager.markPostSentInGroup(
+                    context = applicationContext,
+                    groupName = task.targetGroupName,
+                    caption = task.caption
+                )
                 val msgIdInfo = body.messageId ?: "OK"
                 dao.updateTaskStatus(
                     taskId = taskId,

@@ -1,14 +1,17 @@
 package com.hybrid.whatsappbot.automation
 
+import android.content.Context
+import com.hybrid.whatsappbot.data.AppPreferences
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 
 /**
- * 5-State Sequential State Machine for WhatsApp Two-Stage Media Share Automation.
+ * 6-State Sequential State Machine for WhatsApp Two-Stage Media Share + Auto-Delete Previous Post.
  */
 enum class UiBotSubState {
     IDLE,
@@ -16,7 +19,8 @@ enum class UiBotSubState {
     STATE_2_TYPE_QUERY,
     STATE_3_SELECT_GROUP,
     STATE_4_PICKER_OR_PREVIEW_SEND,
-    STATE_5_DONE
+    STATE_5_DELETE_PREVIOUS_IF_EXISTS,
+    STATE_6_DONE
 }
 
 data class ActiveAutomationSession(
@@ -27,26 +31,31 @@ data class ActiveAutomationSession(
     val subState: UiBotSubState,
     val stateEnteredAtMillis: Long = System.currentTimeMillis(),
     val attemptCountInState: Int = 0,
-    val pickerFabClicked: Boolean = false
+    val pickerFabClicked: Boolean = false,
+    val previousCaptionSnippet: String = ""
 )
 
 /**
- * Thread-safe singleton managing the 20-second automation lock window and single-shot send lock.
+ * Thread-safe singleton managing the automation lock window, single-shot send lock,
+ * and per-group previous post tracking for Auto-Delete Previous Post on Next Send.
  */
 object AutomationStateManager {
 
-    private const val DEFAULT_WINDOW_DURATION_MS = 20_000L
+    private const val DEFAULT_WINDOW_DURATION_MS = 25_000L
 
     private val sessionRef = AtomicReference<ActiveAutomationSession?>(null)
     private val finalSendClicked = AtomicBoolean(false)
+    private val deletePreviousFlowStarted = AtomicBoolean(false)
     private val lastActivityMillis = AtomicLong(0L)
+
+    // In-memory cache mirroring AppPreferences for fast lookups
+    private val activeGroupPostsMap = ConcurrentHashMap<String, String>()
 
     private val _sessionFlow = MutableStateFlow<ActiveAutomationSession?>(null)
     val sessionFlow: StateFlow<ActiveAutomationSession?> = _sessionFlow.asStateFlow()
 
     /**
-     * Activates UI automation for a specific scheduled task with a strict 20-second expiry
-     * and resets the atomic single-shot finalSendClicked lock to false.
+     * Activates UI automation for a specific scheduled task and resets single-shot locks.
      */
     fun activateSession(
         taskId: String,
@@ -56,6 +65,7 @@ object AutomationStateManager {
     ) {
         val now = System.currentTimeMillis()
         finalSendClicked.set(false)
+        deletePreviousFlowStarted.set(false)
         lastActivityMillis.set(now)
 
         val session = ActiveAutomationSession(
@@ -73,16 +83,45 @@ object AutomationStateManager {
     }
 
     /**
-     * Records a bot send event (UI or Background) so NotificationListenerService ignores
-     * self-triggered notifications for the next 15 seconds.
+     * Checks if our bot has already sent a previous post in [groupName].
      */
+    fun hasPreviousPostInGroup(context: Context, groupName: String): Boolean {
+        val key = groupName.trim().lowercase()
+        if (key.isEmpty()) return false
+        if (activeGroupPostsMap.containsKey(key)) return true
+        val persisted = AppPreferences(context).hasPreviousPostInGroup(groupName)
+        if (persisted) {
+            val snippet = AppPreferences(context).getLastSentCaptionSnippet(groupName)
+            activeGroupPostsMap[key] = snippet
+        }
+        return persisted
+    }
+
+    /**
+     * Returns the caption snippet of the last post sent by our bot in [groupName].
+     */
+    fun lastSentCaptionSnippet(context: Context, groupName: String): String {
+        val key = groupName.trim().lowercase()
+        return activeGroupPostsMap[key]
+            ?: AppPreferences(context).getLastSentCaptionSnippet(groupName)
+    }
+
+    /**
+     * Records that our bot has now sent a post in [groupName] with [caption].
+     */
+    fun markPostSentInGroup(context: Context, groupName: String, caption: String) {
+        val key = groupName.trim().lowercase()
+        if (key.isEmpty()) return
+        val snippet = caption.trim().lineSequence().firstOrNull()?.take(40)?.trim()
+            ?: caption.trim().take(40)
+        activeGroupPostsMap[key] = snippet
+        AppPreferences(context).markPostSentInGroup(groupName, caption)
+    }
+
     fun markBotActivityNow() {
         lastActivityMillis.set(System.currentTimeMillis())
     }
 
-    /**
-     * Returns true if a task is currently active OR finished within the last [cooldownWindowMs].
-     */
     fun wasRecentlyActive(cooldownWindowMs: Long = 15_000L): Boolean {
         if (isTaskActive()) return true
         val last = lastActivityMillis.get()
@@ -91,14 +130,12 @@ object AutomationStateManager {
     }
 
     /**
-     * Returns the current session ONLY if it is active, not expired, finalSendClicked is false,
-     * and subState is not STATE_5_DONE.
+     * Returns the current session ONLY if it is active, not expired, and not in STATE_6_DONE.
      */
     fun getValidSession(): ActiveAutomationSession? {
-        if (finalSendClicked.get()) return null
         val current = sessionRef.get() ?: return null
         val now = System.currentTimeMillis()
-        if (now >= current.expiryTimestampMillis || current.subState == UiBotSubState.STATE_5_DONE) {
+        if (now >= current.expiryTimestampMillis || current.subState == UiBotSubState.STATE_6_DONE) {
             if (now >= current.expiryTimestampMillis) {
                 clearSession()
             }
@@ -115,12 +152,13 @@ object AutomationStateManager {
     fun transitionToState(
         taskId: String,
         newState: UiBotSubState,
-        pickerFabClicked: Boolean = false
+        pickerFabClicked: Boolean = false,
+        previousCaptionSnippet: String = ""
     ): Boolean {
         while (true) {
             val current = getValidSession() ?: return false
             if (current.taskId != taskId) return false
-            if (current.subState == UiBotSubState.STATE_5_DONE) return false
+            if (current.subState == UiBotSubState.STATE_6_DONE) return false
 
             val now = System.currentTimeMillis()
             lastActivityMillis.set(now)
@@ -128,7 +166,8 @@ object AutomationStateManager {
                 subState = newState,
                 stateEnteredAtMillis = now,
                 attemptCountInState = 0,
-                pickerFabClicked = pickerFabClicked
+                pickerFabClicked = pickerFabClicked,
+                previousCaptionSnippet = previousCaptionSnippet.ifEmpty { current.previousCaptionSnippet }
             )
             if (sessionRef.compareAndSet(current, updated)) {
                 _sessionFlow.value = updated
@@ -137,9 +176,6 @@ object AutomationStateManager {
         }
     }
 
-    /**
-     * Increments the attempt count within the current state.
-     */
     fun incrementAttempt(taskId: String, markPickerFabClicked: Boolean? = null): Int {
         while (true) {
             val current = getValidSession() ?: return 0
@@ -159,33 +195,38 @@ object AutomationStateManager {
 
     /**
      * CRITICAL ATOMIC SINGLE-SHOT SEND LOCK:
-     * Uses AtomicBoolean.compareAndSet(false, true) and immediately clears the active session
-     * BEFORE the Media Preview Send button click is dispatched.
-     * Guarantees the Send button can never be clicked a second time.
+     * Ensures the Media Preview Send button is clicked at most once per task.
      */
     fun markFinalSendClicked(): Boolean {
         if (!finalSendClicked.compareAndSet(false, true)) {
             return false
         }
-        val now = System.currentTimeMillis()
-        lastActivityMillis.set(now)
-        val current = sessionRef.get()
-        if (current != null) {
-            val doneSession = current.copy(
-                subState = UiBotSubState.STATE_5_DONE,
-                stateEnteredAtMillis = now
-            )
-            sessionRef.set(doneSession)
-        }
-        _sessionFlow.value = null
+        lastActivityMillis.set(System.currentTimeMillis())
         return true
     }
 
     /**
-     * Completely clears the active automation state.
+     * Single-execution lock for STATE_5_DELETE_PREVIOUS_IF_EXISTS so the post-send
+     * delete flow runs at most once per task.
+     */
+    fun tryLockDeletePreviousFlow(): Boolean {
+        if (!deletePreviousFlowStarted.compareAndSet(false, true)) {
+            return false
+        }
+        lastActivityMillis.set(System.currentTimeMillis())
+        return true
+    }
+
+    /**
+     * Completely clears the active automation state and marks STATE_6_DONE.
      */
     fun clearSession() {
-        lastActivityMillis.set(System.currentTimeMillis())
+        val now = System.currentTimeMillis()
+        lastActivityMillis.set(now)
+        val current = sessionRef.get()
+        if (current != null && current.subState != UiBotSubState.STATE_6_DONE) {
+            sessionRef.set(current.copy(subState = UiBotSubState.STATE_6_DONE, stateEnteredAtMillis = now))
+        }
         sessionRef.set(null)
         _sessionFlow.value = null
     }
