@@ -233,7 +233,7 @@ class WhatsAppNotificationListener : NotificationListenerService() {
                 if (isUnlockedAndScreenOn) {
                     delay(800L)
                     var uiRunTicks = 0
-                    while (AutomationStateManager.isTaskActive() && uiRunTicks < 40) {
+                    while (AutomationStateManager.isTaskActive() && uiRunTicks < 100) {
                         delay(500L)
                         uiRunTicks++
                     }

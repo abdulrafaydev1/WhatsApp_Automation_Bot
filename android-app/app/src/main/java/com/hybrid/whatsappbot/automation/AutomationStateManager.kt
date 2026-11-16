@@ -71,11 +71,12 @@ object AutomationStateManager {
         caption.replace(TAG_A, "").replace(TAG_B, "").trim()
 
     /**
-     * Appends the alternating invisible zero-width [tag] to [baseCaption].
+     * Places the alternating invisible zero-width [tag] at the VERY BEGINNING (prefix)
+     * of [baseCaption] so it is never cut off by WhatsApp's "...Read more" truncation.
      */
     fun buildTaggedCaption(baseCaption: String, tag: String): String {
         val clean = stripZeroWidthTags(baseCaption)
-        return if (clean.isEmpty()) tag else "$clean$tag"
+        return if (clean.isEmpty()) tag else "$tag$clean"
     }
 
     /**
@@ -250,9 +251,12 @@ object AutomationStateManager {
             val current = getValidSession() ?: return 0
             if (current.taskId != taskId) return 0
 
+            val now = System.currentTimeMillis()
+            lastActivityMillis.set(now)
             val nextAttempt = current.attemptCountInState + 1
             val updated = current.copy(
                 attemptCountInState = nextAttempt,
+                expiryTimestampMillis = maxOf(current.expiryTimestampMillis, now + 20_000L),
                 pickerFabClicked = markPickerFabClicked ?: current.pickerFabClicked
             )
             if (sessionRef.compareAndSet(current, updated)) {
@@ -267,8 +271,13 @@ object AutomationStateManager {
             val current = getValidSession() ?: return 0
             if (current.taskId != taskId) return 0
 
+            val now = System.currentTimeMillis()
+            lastActivityMillis.set(now)
             val nextScroll = current.scrollUpCount + 1
-            val updated = current.copy(scrollUpCount = nextScroll)
+            val updated = current.copy(
+                scrollUpCount = nextScroll,
+                expiryTimestampMillis = maxOf(current.expiryTimestampMillis, now + 35_000L)
+            )
             if (sessionRef.compareAndSet(current, updated)) {
                 _sessionFlow.value = updated
                 return nextScroll
