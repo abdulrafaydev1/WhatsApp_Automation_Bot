@@ -35,6 +35,12 @@ class WhatsAppAccessibilityService : AccessibilityService() {
     @Volatile
     private var pollingJob: Job? = null
 
+    private sealed class OldPostLookupResult {
+        data class FoundOldPost(val node: AccessibilityNodeInfo) : OldPostLookupResult()
+        object NeedScrollUp : OldPostLookupResult()
+        object NotFoundYet : OldPostLookupResult()
+    }
+
     override fun onServiceConnected() {
         super.onServiceConnected()
         Log.i(TAG, "WhatsAppAccessibilityService connected. Starting session watcher.")
@@ -107,47 +113,40 @@ class WhatsAppAccessibilityService : AccessibilityService() {
     }
 
     /**
-     * Core 6-State Machine Dispatcher executed inside [stepMutex].
+     * Core Sequential State Machine Dispatcher executed inside [stepMutex].
      */
     private suspend fun inspectAndAdvance(rootNode: AccessibilityNodeInfo) {
         val session = AutomationStateManager.getValidSession() ?: return
 
         // =====================================================================
-        // STRICT GROUP CHAT SCREEN GUARD:
-        // If we are inside the live Group Chat screen during STATE_3 or STATE_4
-        // (before STATE_5_DELETE_PREVIOUS_IF_EXISTS), abort send clicks immediately
-        // so we never tap the Voice Note (Mic) or Call buttons.
+        // FIX #1: Disable Premature Chat-Screen Abort During Delete Phase!
+        // Only trigger the live chat guard if we somehow landed in the chat screen
+        // during STATE_3 or STATE_4 BEFORE STATE_5A/5B/5C.
         // =====================================================================
         if ((session.subState == UiBotSubState.STATE_3_SELECT_GROUP ||
                 session.subState == UiBotSubState.STATE_4_PICKER_OR_PREVIEW_SEND) &&
             isInsideLiveChatScreen(rootNode)
         ) {
-            Log.i(TAG, "Chat Screen Guard triggered during ${session.subState}: Aborting send clicks.")
             AutomationStateManager.markFinalSendClicked()
             val hadPrevious = AutomationStateManager.hasPreviousPostInGroup(
                 context = applicationContext,
                 groupName = session.targetGroupName
             )
-            val prevSnippet = AutomationStateManager.lastSentCaptionSnippet(
-                context = applicationContext,
-                groupName = session.targetGroupName
-            )
-            AutomationStateManager.markPostSentInGroup(
-                context = applicationContext,
-                groupName = session.targetGroupName,
-                caption = session.caption
-            )
-
             if (hadPrevious) {
+                Log.i(TAG, "Landed in live chat screen with existing previous post -> transitioning to STATE_5A_FIND_OLD_POST")
                 AutomationStateManager.transitionToState(
                     taskId = session.taskId,
-                    newState = UiBotSubState.STATE_5_DELETE_PREVIOUS_IF_EXISTS,
-                    previousCaptionSnippet = prevSnippet
-                )
-                executeState5DeletePreviousIfExists(
-                    AutomationStateManager.getValidSession() ?: session.copy(previousCaptionSnippet = prevSnippet)
+                    newState = UiBotSubState.STATE_5A_FIND_OLD_POST,
+                    extendExpiryMillis = 20_000L
                 )
             } else {
+                Log.i(TAG, "Landed in live chat screen (1st post in group) -> recording post & completing.")
+                AutomationStateManager.markPostSentInGroup(
+                    context = applicationContext,
+                    groupName = session.targetGroupName,
+                    baseCaption = session.baseCaption,
+                    sentTag = session.currentTag
+                )
                 AutomationStateManager.clearSession()
                 pollingJob?.cancel()
                 markTaskCompletedInDatabase(session, deletedPrevious = false)
@@ -175,8 +174,16 @@ class WhatsAppAccessibilityService : AccessibilityService() {
                 executeState4PickerOrPreviewSend(rootNode, session)
             }
 
-            UiBotSubState.STATE_5_DELETE_PREVIOUS_IF_EXISTS -> {
-                executeState5DeletePreviousIfExists(session)
+            UiBotSubState.STATE_5A_FIND_OLD_POST -> {
+                executeState5AFindOldPost(rootNode, session)
+            }
+
+            UiBotSubState.STATE_5B_CLICK_TRASH_ICON -> {
+                executeState5BClickTrashIcon(rootNode, session)
+            }
+
+            UiBotSubState.STATE_5C_CLICK_DELETE_FOR_EVERYONE -> {
+                executeState5CClickDeleteForEveryone(rootNode, session)
             }
         }
     }
@@ -318,11 +325,13 @@ class WhatsAppAccessibilityService : AccessibilityService() {
     }
 
     /**
-     * STATE 4: Clean Separation Between Contact Picker Screen vs. Media Preview Screen
-     * with Atomic Single-Shot Send Lock.
-     * After clicking Send on Media Preview:
-     * - If 1st post in this group -> Finish immediately (STATE_6_DONE).
-     * - If previous post already exists in this group -> Transition to STATE_5_DELETE_PREVIOUS_IF_EXISTS.
+     * STATE 4: Media Preview & Picker Send Handler.
+     * - Injects [session.taggedCaption] (with the alternating zero-width Unicode signature)
+     *   if WhatsApp stripped it.
+     * - Clicks the Media Preview Send button once.
+     * - If 1st post in this group: Records tag and finishes immediately.
+     * - If 2nd+ post in this group: Does NOT exit WhatsApp; extends expiry by +20_000ms and
+     *   transitions to STATE_5A_FIND_OLD_POST.
      */
     private suspend fun executeState4PickerOrPreviewSend(
         rootNode: AccessibilityNodeInfo,
@@ -336,7 +345,7 @@ class WhatsAppAccessibilityService : AccessibilityService() {
         val onContactPicker = isStillOnContactPickerScreen(rootNode) && !onMediaPreview
 
         // =====================================================================
-        // CASE A: Direct or Completed Transition to Media Preview Screen
+        // CASE A: On Media Preview Screen -> Ensure Tagged Caption & Click Send
         // =====================================================================
         if (onMediaPreview || !onContactPicker) {
             val finalSendButton = findSendButton(rootNode)
@@ -345,27 +354,21 @@ class WhatsAppAccessibilityService : AccessibilityService() {
                 return
             }
 
-            // Populate caption if empty on the Media Preview screen
-            if (session.caption.isNotBlank()) {
-                val captionEditNode = findCaptionEditTextOnPreview(rootNode)
-                if (captionEditNode != null) {
-                    val currentText = captionEditNode.text?.toString()?.trim() ?: ""
-                    val isPlaceholderOrEmpty = currentText.isEmpty() ||
-                        currentText.equals("Add a caption...", ignoreCase = true) ||
-                        currentText.equals("Add a caption", ignoreCase = true)
-
-                    if (isPlaceholderOrEmpty) {
-                        val captionArgs = Bundle().apply {
-                            putCharSequence(
-                                AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE,
-                                session.caption
-                            )
-                        }
-                        captionEditNode.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
-                        captionEditNode.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, captionArgs)
-                        Log.i(TAG, "STATE_4 (Case A): Populated caption field on Media Preview screen.")
-                        delay(300L)
+            // Ensure the caption field contains our alternating zero-width Unicode tag (currentTag)
+            val captionEditNode = findCaptionEditTextOnPreview(rootNode)
+            if (captionEditNode != null && session.taggedCaption.isNotEmpty()) {
+                val currentText = captionEditNode.text?.toString() ?: ""
+                if (!currentText.contains(session.currentTag)) {
+                    val captionArgs = Bundle().apply {
+                        putCharSequence(
+                            AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE,
+                            session.taggedCaption
+                        )
                     }
+                    captionEditNode.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
+                    captionEditNode.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, captionArgs)
+                    Log.i(TAG, "STATE_4: Injected taggedCaption with invisible signature into Media Preview.")
+                    delay(300L)
                 }
             }
 
@@ -379,21 +382,9 @@ class WhatsAppAccessibilityService : AccessibilityService() {
                 return
             }
 
-            // Check whether a previous post from our bot ALREADY exists in this group
             val hadPreviousPost = AutomationStateManager.hasPreviousPostInGroup(
                 context = applicationContext,
                 groupName = session.targetGroupName
-            )
-            val previousSnippet = AutomationStateManager.lastSentCaptionSnippet(
-                context = applicationContext,
-                groupName = session.targetGroupName
-            )
-
-            // Record that this group now has an active post from us
-            AutomationStateManager.markPostSentInGroup(
-                context = applicationContext,
-                groupName = session.targetGroupName,
-                caption = session.caption
             )
 
             // Perform a single ACTION_CLICK on the Media Preview Send button (no gesture fallback)
@@ -405,27 +396,29 @@ class WhatsAppAccessibilityService : AccessibilityService() {
             )
 
             if (!hadPreviousPost) {
-                // 1st post in this group: Finish immediately (STATE_6_DONE)
+                // 1st post in this group: Record tag, mark COMPLETED_UI, and finish normally
+                AutomationStateManager.markPostSentInGroup(
+                    context = applicationContext,
+                    groupName = session.targetGroupName,
+                    baseCaption = session.baseCaption,
+                    sentTag = session.currentTag
+                )
                 AutomationStateManager.clearSession()
                 pollingJob?.cancel()
                 markTaskCompletedInDatabase(session, deletedPrevious = false)
             } else {
-                // 2nd+ post in this group: Transition to STATE_5_DELETE_PREVIOUS_IF_EXISTS
-                updateDatabaseStatusOnly(
-                    taskId = session.taskId,
-                    logMessage = "Sent new post to \"${session.targetGroupName}\". Auto-deleting previous post..."
+                // 2nd+ post in this group: Do NOT mark completed or exit Home yet!
+                // Extend expiryTimestamp by +20_000ms and transition to STATE_5A_FIND_OLD_POST
+                Log.i(
+                    TAG,
+                    "STATE_4 -> STATE_5A_FIND_OLD_POST: Previous post exists in '${session.targetGroupName}'. " +
+                        "Extending window +20s to delete 1st post (prevTagLen=${session.previousTag.length})."
                 )
                 AutomationStateManager.transitionToState(
                     taskId = session.taskId,
-                    newState = UiBotSubState.STATE_5_DELETE_PREVIOUS_IF_EXISTS,
-                    previousCaptionSnippet = previousSnippet
+                    newState = UiBotSubState.STATE_5A_FIND_OLD_POST,
+                    extendExpiryMillis = 20_000L
                 )
-                val updatedSession = AutomationStateManager.getValidSession()
-                    ?: session.copy(
-                        subState = UiBotSubState.STATE_5_DELETE_PREVIOUS_IF_EXISTS,
-                        previousCaptionSnippet = previousSnippet
-                    )
-                executeState5DeletePreviousIfExists(updatedSession)
             }
             return
         }
@@ -464,92 +457,210 @@ class WhatsAppAccessibilityService : AccessibilityService() {
         }
     }
 
+    // =========================================================================
+    // FIX #2 & #3: EXPLICIT 3-STEP DELETE STATE MACHINE (STATE_5A -> 5B -> 5C)
+    // =========================================================================
+
     /**
-     * STATE 5: Post-Send Previous Message Deletion Flow ("Delete for everyone")
-     * Protected by single-execution AtomicBoolean [AutomationStateManager.tryLockDeletePreviousFlow].
+     * STATE_5A_FIND_OLD_POST:
+     * 1. Waits 1500ms after entering the Group Chat screen for the newly sent 2nd post to settle.
+     * 2. If the top action-bar Delete icon is already visible on screen, transitions immediately to STATE_5B.
+     * 3. Searches for the older (1st) post while strictly ignoring any node carrying [session.currentTag]
+     *    or sitting at the bottom of the screen as the only visible post.
+     * 4. If only the newly sent 2nd post is visible at the bottom, scrolls UP (up to 3 attempts,
+     *    waiting 900ms after each scroll) to bring the older 1st post back onto the screen.
+     * 5. Once the older 1st post is located, performs a 1000ms long-press and waits for the
+     *    top action bar delete icon to appear before transitioning to STATE_5B_CLICK_TRASH_ICON.
      */
-    private suspend fun executeState5DeletePreviousIfExists(session: ActiveAutomationSession) {
-        if (!AutomationStateManager.tryLockDeletePreviousFlow()) {
+    private suspend fun executeState5AFindOldPost(
+        rootNode: AccessibilityNodeInfo,
+        session: ActiveAutomationSession
+    ) {
+        val elapsedInState = System.currentTimeMillis() - session.stateEnteredAtMillis
+        if (elapsedInState < 1_500L) {
             return
         }
 
-        var deletedSuccessfully = false
-        try {
-            // 1. Wait 1200ms for the new post bubble to settle at the bottom of the Group Chat screen
-            Log.i(TAG, "STATE_5: Waiting 1200ms for new post bubble to settle in '${session.targetGroupName}'...")
-            delay(1_200L)
+        // If the contextual action-bar Delete (Trash) icon is already visible, advance to STATE_5B!
+        if (findActionBarDeleteIcon(rootNode) != null) {
+            Log.i(TAG, "STATE_5A: Action-bar Delete icon is visible -> transitioning to STATE_5B_CLICK_TRASH_ICON")
+            AutomationStateManager.transitionToState(
+                taskId = session.taskId,
+                newState = UiBotSubState.STATE_5B_CLICK_TRASH_ICON
+            )
+            return
+        }
 
-            val chatRoot = getBestWhatsAppRootNode()
-            if (chatRoot != null) {
-                // 2. Locate the Previous Post Bubble (older bubble above the newly sent bottom bubble)
-                val previousBubble = findPreviousPostBubbleInChat(
-                    root = chatRoot,
-                    previousCaptionSnippet = session.previousCaptionSnippet,
-                    currentCaption = session.caption
-                )
-
-                if (previousBubble != null) {
-                    // 3. Long-Press the Previous Post Bubble (ACTION_LONG_CLICK with 1000ms gesture fallback)
-                    val longPressed = longPressBubbleNode(previousBubble)
-                    Log.i(TAG, "STATE_5: Long-pressed previous post bubble (longPressed=$longPressed). Waiting 800ms...")
-
-                    // 4. Wait 800ms and click the Top Action-Bar Delete (Trash) Icon
-                    delay(800L)
-                    val actionBarRoot = getBestWhatsAppRootNode()
-                    val deleteTrashIcon = actionBarRoot?.let { findActionBarDeleteIcon(it) }
-
-                    if (deleteTrashIcon != null) {
-                        val trashClicked = clickNodeOrParentActionOnly(deleteTrashIcon)
-                        Log.i(TAG, "STATE_5: Clicked top action-bar Delete icon (trashClicked=$trashClicked). Waiting 700ms...")
-
-                        // 5. Wait 700ms and click "Delete for everyone" in the confirmation dialog
-                        delay(700L)
-                        val dialogRoot = getBestWhatsAppRootNode()
-                        val deleteForEveryoneBtn = dialogRoot?.let { findDeleteForEveryoneButton(it) }
-
-                        if (deleteForEveryoneBtn != null) {
-                            deletedSuccessfully = clickNodeOrParentActionOnly(deleteForEveryoneBtn)
-                            Log.i(TAG, "STATE_5: Clicked 'Delete for everyone' button (deleted=$deletedSuccessfully)!")
-                            delay(500L)
-                        } else {
-                            Log.w(TAG, "STATE_5: 'Delete for everyone' button not found in dialog.")
-                        }
-                    } else {
-                        Log.w(TAG, "STATE_5: Action-bar Delete (Trash) icon not found after long-press.")
-                    }
+        when (val lookup = lookupOlderFirstPostBubble(rootNode, session)) {
+            is OldPostLookupResult.FoundOldPost -> {
+                val attempt = AutomationStateManager.incrementAttempt(session.taskId)
+                val usedActionLongClick = if (attempt == 1) {
+                    tryActionLongClickOnParent(lookup.node)
                 } else {
-                    Log.w(TAG, "STATE_5: Could not locate previous post bubble in chat '${session.targetGroupName}'.")
+                    false
+                }
+
+                if (!usedActionLongClick) {
+                    dispatchOneSecondHoldGesture(lookup.node)
+                    // Wait 1250ms so the 1000ms continuous finger hold finishes AND the action bar renders
+                    delay(1_250L)
+                } else {
+                    delay(750L)
+                }
+
+                val postPressRoot = getBestWhatsAppRootNode()
+                if (postPressRoot != null && findActionBarDeleteIcon(postPressRoot) != null) {
+                    Log.i(TAG, "STATE_5A -> STATE_5B: Older 1st post selected & Trash icon visible!")
+                    AutomationStateManager.transitionToState(
+                        taskId = session.taskId,
+                        newState = UiBotSubState.STATE_5B_CLICK_TRASH_ICON
+                    )
+                } else if (attempt >= 3) {
+                    Log.w(TAG, "STATE_5A: Action bar did not appear after 3 long-press attempts. Finishing cleanly.")
+                    finishDeleteFlowAndExit(session, deletedSuccessfully = false)
                 }
             }
-        } catch (e: Exception) {
-            Log.e(TAG, "STATE_5: Exception during previous post auto-deletion", e)
-        } finally {
-            // 6. Immediately mark COMPLETED_UI, clear session, and stop the automation loop
-            AutomationStateManager.clearSession()
-            pollingJob?.cancel()
-            markTaskCompletedInDatabase(session, deletedPrevious = deletedSuccessfully)
+
+            is OldPostLookupResult.NeedScrollUp -> {
+                if (session.scrollUpCount < 3) {
+                    val scrollNum = AutomationStateManager.incrementScrollUpCount(session.taskId)
+                    Log.i(
+                        TAG,
+                        "STATE_5A: Only newly sent 2nd post visible at bottom. " +
+                            "Scrolling UP to bring 1st post into view (scroll $scrollNum/3)..."
+                    )
+                    performScrollUpInChat(rootNode)
+                    delay(900L)
+                } else {
+                    Log.w(TAG, "STATE_5A: Older 1st post not found after 3 upward scrolls. Aborting delete without touching 2nd post.")
+                    finishDeleteFlowAndExit(session, deletedSuccessfully = false)
+                }
+            }
+
+            is OldPostLookupResult.NotFoundYet -> {
+                val attempt = AutomationStateManager.incrementAttempt(session.taskId)
+                if (attempt >= 3 && session.scrollUpCount < 3) {
+                    val scrollNum = AutomationStateManager.incrementScrollUpCount(session.taskId)
+                    Log.i(TAG, "STATE_5A: Caption not visible yet; scrolling UP (scroll $scrollNum/3)...")
+                    performScrollUpInChat(rootNode)
+                    delay(900L)
+                } else if (attempt >= 7) {
+                    Log.w(TAG, "STATE_5A: Timed out searching for older post. Finishing cleanly.")
+                    finishDeleteFlowAndExit(session, deletedSuccessfully = false)
+                }
+            }
         }
     }
 
     /**
-     * Locates the previous post bubble sent by us inside the Group Chat screen:
-     * Searches visible chat nodes matching our caption snippet (or outgoing media/message bubbles
-     * on the right side of the screen, rect.centerX() > screenWidth / 2) and selects the node
-     * with the smaller Y-coordinate (the older message bubble above the newly sent bottom one).
+     * STATE_5B_CLICK_TRASH_ICON:
+     * Locates the top action bar trash/delete icon (com.whatsapp:id/menuitem_delete or
+     * contentDescription == "Delete") and clicks it once via ACTION_CLICK.
+     * Waits 700ms and transitions to STATE_5C_CLICK_DELETE_FOR_EVERYONE.
      */
-    private fun findPreviousPostBubbleInChat(
+    private suspend fun executeState5BClickTrashIcon(
+        rootNode: AccessibilityNodeInfo,
+        session: ActiveAutomationSession
+    ) {
+        // If the confirmation dialog "Delete for everyone" is already open on screen, advance to 5C
+        if (findDeleteForEveryoneButton(rootNode) != null) {
+            AutomationStateManager.transitionToState(
+                taskId = session.taskId,
+                newState = UiBotSubState.STATE_5C_CLICK_DELETE_FOR_EVERYONE
+            )
+            return
+        }
+
+        val trashIcon = findActionBarDeleteIcon(rootNode)
+        if (trashIcon != null) {
+            val attempt = AutomationStateManager.incrementAttempt(session.taskId)
+            val clicked = clickNodeOrParentOrGesture(
+                node = trashIcon,
+                forceGestureFallback = attempt >= 2
+            )
+            Log.i(TAG, "STATE_5B: Clicked top action-bar Delete (Trash) icon (attempt=$attempt, clicked=$clicked). Waiting 700ms...")
+            delay(700L)
+
+            AutomationStateManager.transitionToState(
+                taskId = session.taskId,
+                newState = UiBotSubState.STATE_5C_CLICK_DELETE_FOR_EVERYONE
+            )
+        } else {
+            val attempt = AutomationStateManager.incrementAttempt(session.taskId)
+            if (attempt >= 4) {
+                Log.w(TAG, "STATE_5B: Delete icon disappeared before click. Returning to STATE_5A.")
+                AutomationStateManager.transitionToState(
+                    taskId = session.taskId,
+                    newState = UiBotSubState.STATE_5A_FIND_OLD_POST
+                )
+            }
+        }
+    }
+
+    /**
+     * STATE_5C_CLICK_DELETE_FOR_EVERYONE:
+     * Locates the dialog button matching "Delete for everyone", clicks it via ACTION_CLICK,
+     * waits 800ms, updates lastSentTag = currentTag for the group, marks the task COMPLETED_UI,
+     * and only THEN stops the automation loop and exits cleanly.
+     */
+    private suspend fun executeState5CClickDeleteForEveryone(
+        rootNode: AccessibilityNodeInfo,
+        session: ActiveAutomationSession
+    ) {
+        val deleteForEveryoneBtn = findDeleteForEveryoneButton(rootNode)
+        if (deleteForEveryoneBtn != null) {
+            val attempt = AutomationStateManager.incrementAttempt(session.taskId)
+            val clicked = clickNodeOrParentOrGesture(
+                node = deleteForEveryoneBtn,
+                forceGestureFallback = attempt >= 2
+            )
+            Log.i(
+                TAG,
+                "STATE_5C: Clicked 'Delete for everyone' button (attempt=$attempt, clicked=$clicked)! Waiting 800ms..."
+            )
+            delay(800L)
+            finishDeleteFlowAndExit(session, deletedSuccessfully = true)
+        } else {
+            val attempt = AutomationStateManager.incrementAttempt(session.taskId)
+            if (attempt >= 5) {
+                Log.w(TAG, "STATE_5C: 'Delete for everyone' dialog button not found after 5 ticks. Finishing cleanly.")
+                finishDeleteFlowAndExit(session, deletedSuccessfully = false)
+            }
+        }
+    }
+
+    private fun finishDeleteFlowAndExit(
+        session: ActiveAutomationSession,
+        deletedSuccessfully: Boolean
+    ) {
+        // Save currentTag as the new active tag for this group so the 3rd post will delete this 2nd post
+        AutomationStateManager.markPostSentInGroup(
+            context = applicationContext,
+            groupName = session.targetGroupName,
+            baseCaption = session.baseCaption,
+            sentTag = session.currentTag
+        )
+        AutomationStateManager.clearSession()
+        pollingJob?.cancel()
+        markTaskCompletedInDatabase(session, deletedPrevious = deletedSuccessfully)
+    }
+
+    // =========================================================================
+    // FOOLPROOF 1ST (OLD) POST vs 2ND (NEW) POST DISTINCTION & AUTO-SCROLL
+    // =========================================================================
+
+    private fun lookupOlderFirstPostBubble(
         root: AccessibilityNodeInfo,
-        previousCaptionSnippet: String,
-        currentCaption: String
-    ): AccessibilityNodeInfo? {
+        session: ActiveAutomationSession
+    ): OldPostLookupResult {
         val displayMetrics = resources.displayMetrics
         val screenWidth = displayMetrics.widthPixels.takeIf { it > 0 } ?: 1080
         val screenHeight = displayMetrics.heightPixels.takeIf { it > 0 } ?: 2400
 
-        val minChatY = (screenHeight * 0.14f).toInt()
-        val maxChatY = (screenHeight * 0.88f).toInt()
+        val minChatY = (screenHeight * 0.12f).toInt()
+        val maxChatY = (screenHeight * 0.89f).toInt()
 
-        val allNodes = collectAllNodes(root).filter { node ->
+        val chatNodes = collectAllNodes(root).filter { node ->
             if (!node.isVisibleToUser) return@filter false
             if (isSearchOrEditableNode(node) || isBlacklistedVoiceOrCallNode(node)) return@filter false
             val viewId = node.viewIdResourceName?.lowercase() ?: ""
@@ -565,64 +676,156 @@ class WhatsAppAccessibilityService : AccessibilityService() {
             !r.isEmpty && r.centerY() in minChatY..maxChatY
         }
 
-        val snippetToMatch = previousCaptionSnippet.trim()
-            .ifEmpty { currentCaption.trim().lineSequence().firstOrNull()?.take(40)?.trim() ?: "" }
-
-        // Strategy 1: Match by caption text snippet
-        if (snippetToMatch.isNotEmpty()) {
-            val captionNodes = allNodes.filter { node ->
-                val txt = node.text?.toString()?.trim() ?: ""
-                val desc = node.contentDescription?.toString()?.trim() ?: ""
-                txt.contains(snippetToMatch, ignoreCase = true) ||
-                    desc.contains(snippetToMatch, ignoreCase = true)
-            }
-
-            val deduplicatedByRow = deduplicateNodesByVerticalRow(captionNodes)
-            if (deduplicatedByRow.size >= 2) {
-                // Newly sent post is at the bottom (last index); select the older bubble above it
-                return deduplicatedByRow[deduplicatedByRow.size - 2]
-            } else if (deduplicatedByRow.size == 1) {
-                val single = deduplicatedByRow.first()
-                val currentSnippet = currentCaption.trim().lineSequence().firstOrNull()?.take(40)?.trim() ?: ""
-                val rect = Rect().also { single.getBoundsInScreen(it) }
-                // If the previous caption differs from current caption, or the bubble is in the upper 70% of screen
-                if (!snippetToMatch.equals(currentSnippet, ignoreCase = true) ||
-                    rect.bottom < (screenHeight * 0.72f).toInt()
-                ) {
-                    return single
+        // 1. Direct Zero-Width Tag Match for the 1st (Old) Post (previousTag):
+        if (session.previousTag.isNotEmpty()) {
+            val previousTaggedNode = chatNodes
+                .filter { node ->
+                    val txt = node.text?.toString() ?: ""
+                    val desc = node.contentDescription?.toString() ?: ""
+                    (txt.contains(session.previousTag) || desc.contains(session.previousTag)) &&
+                        !txt.contains(session.currentTag) &&
+                        !desc.contains(session.currentTag)
                 }
+                .minByOrNull { node ->
+                    val r = Rect().also { node.getBoundsInScreen(it) }
+                    r.top
+                }
+
+            if (previousTaggedNode != null) {
+                Log.i(TAG, "STATE_5A: Matched older 1st post directly via invisible previousTag!")
+                return OldPostLookupResult.FoundOldPost(previousTaggedNode)
             }
         }
 
-        // Strategy 2: Outgoing media/message bubble containers on the right side of the screen
-        val rightSideBubbles = allNodes.filter { node ->
-            val r = Rect()
-            node.getBoundsInScreen(r)
+        // 2. Match by Base Caption Text while strictly rejecting any node carrying currentTag:
+        val baseSnippet = session.previousCaptionSnippet.trim()
+            .ifEmpty { session.baseCaption.lineSequence().firstOrNull()?.take(40)?.trim() ?: "" }
+
+        if (baseSnippet.isNotEmpty()) {
+            val allMatchingCaptionNodes = chatNodes.filter { node ->
+                val txt = node.text?.toString() ?: ""
+                val desc = node.contentDescription?.toString() ?: ""
+                val cleanTxt = AutomationStateManager.stripZeroWidthTags(txt)
+                val cleanDesc = AutomationStateManager.stripZeroWidthTags(desc)
+                cleanTxt.contains(baseSnippet, ignoreCase = true) ||
+                    cleanDesc.contains(baseSnippet, ignoreCase = true)
+            }
+
+            // Group into distinct message bubbles sorted by rect.top ascending (top = oldest, bottom = newest)
+            val sortedBubblesTopToBottom = deduplicateNodesByVerticalRow(allMatchingCaptionNodes)
+
+            if (sortedBubblesTopToBottom.size >= 2) {
+                val oldestUpperBubble = sortedBubblesTopToBottom.first()
+                val newestBottomBubble = sortedBubblesTopToBottom.last()
+
+                // Verify the upper bubble does NOT carry currentTag and sits strictly above the bottom bubble
+                val upperText = oldestUpperBubble.text?.toString() ?: ""
+                val upperRect = Rect().also { oldestUpperBubble.getBoundsInScreen(it) }
+                val bottomRect = Rect().also { newestBottomBubble.getBoundsInScreen(it) }
+
+                if (!upperText.contains(session.currentTag) && upperRect.top < bottomRect.top - 80) {
+                    Log.i(
+                        TAG,
+                        "STATE_5A: Found ${sortedBubblesTopToBottom.size} matching posts on screen; " +
+                            "selecting upper 1st post at top=${upperRect.top} (ignoring bottom 2nd post at top=${bottomRect.top})."
+                    )
+                    return OldPostLookupResult.FoundOldPost(oldestUpperBubble)
+                }
+            } else if (sortedBubblesTopToBottom.size == 1) {
+                val singleNode = sortedBubblesTopToBottom.first()
+                val singleText = singleNode.text?.toString() ?: ""
+                val singleRect = Rect().also { singleNode.getBoundsInScreen(it) }
+
+                val hasCurrentNewTag = session.currentTag.isNotEmpty() && singleText.contains(session.currentTag)
+                val hasPreviousOldTag = session.previousTag.isNotEmpty() && singleText.contains(session.previousTag)
+
+                if (hasPreviousOldTag && !hasCurrentNewTag) {
+                    return OldPostLookupResult.FoundOldPost(singleNode)
+                }
+
+                // If the single visible node has currentTag OR sits in the lower half of the screen
+                // (rect.bottom > screenHeight * 0.55), it is the newly sent 2nd post -> DO NOT LONG-PRESS IT!
+                // Scroll UP to bring the 1st post back onto the screen!
+                if (hasCurrentNewTag || singleRect.bottom > (screenHeight * 0.55f).toInt()) {
+                    Log.i(
+                        TAG,
+                        "STATE_5A: Single visible matching post at bottom=${singleRect.bottom} " +
+                            "(hasCurrentTag=$hasCurrentNewTag) is the newly sent 2nd post -> requesting Scroll Up!"
+                    )
+                    return OldPostLookupResult.NeedScrollUp
+                }
+
+                // If we already scrolled up and the single visible bubble is in the top half of the screen
+                // without currentTag, it is the older 1st post
+                if (session.scrollUpCount > 0 && !hasCurrentNewTag) {
+                    return OldPostLookupResult.FoundOldPost(singleNode)
+                }
+
+                return OldPostLookupResult.NeedScrollUp
+            }
+        }
+
+        // 3. Fallback for image-only posts (empty caption):
+        val rightSideMediaBubbles = chatNodes.filter { node ->
+            val r = Rect().also { node.getBoundsInScreen(it) }
             val viewId = node.viewIdResourceName?.lowercase() ?: ""
-            val isOutgoingPosition = r.centerX() > (screenWidth / 2) &&
-                r.width() > (screenWidth * 0.22f).toInt() &&
-                r.height() > 60
-            val isBubbleView = viewId.contains("main_layout") ||
-                viewId.contains("media_container") ||
+            val txt = node.text?.toString() ?: ""
+            if (session.currentTag.isNotEmpty() && txt.contains(session.currentTag)) {
+                return@filter false
+            }
+            val isRightSide = r.centerX() > (screenWidth / 2) &&
+                r.width() > (screenWidth * 0.25f).toInt() &&
+                r.height() > 80
+            val isMediaContainer = viewId.contains("media_container") ||
                 viewId.contains("image") ||
                 viewId.contains("thumb") ||
-                viewId.contains("message_text") ||
-                node.isLongClickable
-            isOutgoingPosition && isBubbleView
+                viewId.contains("main_layout")
+            isRightSide && isMediaContainer
         }
 
-        val sortedOutgoingRows = deduplicateNodesByVerticalRow(rightSideBubbles)
-        if (sortedOutgoingRows.size >= 2) {
-            // Select the outgoing bubble directly above the newly sent bottom bubble
-            return sortedOutgoingRows[sortedOutgoingRows.size - 2]
+        val sortedMediaRows = deduplicateNodesByVerticalRow(rightSideMediaBubbles)
+        if (sortedMediaRows.size >= 2) {
+            return OldPostLookupResult.FoundOldPost(sortedMediaRows.first())
+        } else if (sortedMediaRows.size == 1) {
+            val singleRect = Rect().also { sortedMediaRows.first().getBoundsInScreen(it) }
+            if (singleRect.bottom > (screenHeight * 0.55f).toInt()) {
+                return OldPostLookupResult.NeedScrollUp
+            }
         }
 
-        return null
+        return OldPostLookupResult.NotFoundYet
     }
 
     /**
-     * Sorts candidate nodes by Y-coordinate ascending (top-to-bottom on screen) and merges nodes
-     * belonging to the same message bubble (within 90px vertical center distance).
+     * Scrolls the chat message list UPWARD (swiping finger DOWN from 30% to 78% of screen height
+     * over 400ms) so older messages above the newly sent bottom post come back into view.
+     */
+    private fun performScrollUpInChat(root: AccessibilityNodeInfo) {
+        val displayMetrics = resources.displayMetrics
+        val screenWidth = displayMetrics.widthPixels.takeIf { it > 0 } ?: 1080
+        val screenHeight = displayMetrics.heightPixels.takeIf { it > 0 } ?: 2400
+
+        val centerX = screenWidth / 2f
+        val startY = screenHeight * 0.30f
+        val endY = screenHeight * 0.78f
+
+        val swipePath = Path().apply {
+            moveTo(centerX, startY)
+            lineTo(centerX, endY)
+        }
+        val stroke = GestureDescription.StrokeDescription(swipePath, 0L, 400L)
+        val gesture = GestureDescription.Builder().addStroke(stroke).build()
+        val dispatched = dispatchGesture(gesture, null, null)
+
+        if (!dispatched) {
+            val scrollableList = collectAllNodes(root).firstOrNull { it.isScrollable }
+            scrollableList?.performAction(AccessibilityNodeInfo.ACTION_SCROLL_BACKWARD)
+        }
+    }
+
+    /**
+     * Sorts candidate nodes by rect.top ascending (smaller rect.top = higher up on screen = older post)
+     * and merges nodes belonging to the same message bubble (within 120px vertical center distance).
      */
     private fun deduplicateNodesByVerticalRow(
         nodes: List<AccessibilityNodeInfo>
@@ -630,14 +833,14 @@ class WhatsAppAccessibilityService : AccessibilityService() {
         val sorted = nodes.sortedBy { node ->
             val r = Rect()
             node.getBoundsInScreen(r)
-            r.centerY()
+            r.top
         }
         val distinctRows = mutableListOf<AccessibilityNodeInfo>()
         for (candidate in sorted) {
             val candRect = Rect().also { candidate.getBoundsInScreen(it) }
             val overlapsExistingRow = distinctRows.any { existing ->
                 val exRect = Rect().also { existing.getBoundsInScreen(it) }
-                abs(candRect.centerY() - exRect.centerY()) < 90
+                abs(candRect.centerY() - exRect.centerY()) < 120
             }
             if (!overlapsExistingRow) {
                 distinctRows.add(candidate)
@@ -646,25 +849,22 @@ class WhatsAppAccessibilityService : AccessibilityService() {
         return distinctRows
     }
 
-    /**
-     * Long-presses the target chat bubble:
-     * 1. Tries ACTION_LONG_CLICK on the node or its long-clickable parent (up to 6 levels).
-     * 2. Fallback: Dispatches a 1000ms continuous press gesture at (rect.centerX(), rect.centerY()).
-     */
-    private fun longPressBubbleNode(node: AccessibilityNodeInfo): Boolean {
+    private fun tryActionLongClickOnParent(node: AccessibilityNodeInfo): Boolean {
         var current: AccessibilityNodeInfo? = node
         var depth = 0
         while (current != null && depth <= 6) {
             if (current.isLongClickable && current.isEnabled) {
-                val longClicked = current.performAction(AccessibilityNodeInfo.ACTION_LONG_CLICK)
-                if (longClicked) {
+                if (current.performAction(AccessibilityNodeInfo.ACTION_LONG_CLICK)) {
                     return true
                 }
             }
             current = current.parent
             depth++
         }
+        return false
+    }
 
+    private fun dispatchOneSecondHoldGesture(node: AccessibilityNodeInfo): Boolean {
         val rect = Rect()
         node.getBoundsInScreen(rect)
         if (rect.isEmpty || rect.centerX() <= 0 || rect.centerY() <= 0) {
@@ -678,11 +878,10 @@ class WhatsAppAccessibilityService : AccessibilityService() {
             val stroke = GestureDescription.StrokeDescription(pressPath, 0L, 1_000L)
             val gesture = GestureDescription.Builder().addStroke(stroke).build()
             val dispatched = dispatchGesture(gesture, null, null)
-            Log.i(TAG, "Dispatched 1000ms long-press gesture at ($tapX, $tapY) -> dispatched=$dispatched")
-            if (dispatched) return true
+            Log.i(TAG, "Dispatched 1000ms long-press hold at ($tapX, $tapY) -> dispatched=$dispatched")
+            return dispatched
         }
-
-        return node.performAction(AccessibilityNodeInfo.ACTION_LONG_CLICK)
+        return false
     }
 
     private fun findActionBarDeleteIcon(root: AccessibilityNodeInfo): AccessibilityNodeInfo? {
@@ -731,20 +930,6 @@ class WhatsAppAccessibilityService : AccessibilityService() {
         }
     }
 
-    private fun updateDatabaseStatusOnly(taskId: String, logMessage: String) {
-        serviceScope.launch(Dispatchers.IO) {
-            runCatching {
-                val dao = AppDatabase.getInstance(applicationContext).taskDao()
-                dao.updateTaskStatus(
-                    taskId = taskId,
-                    newStatus = TaskStatus.COMPLETED_UI,
-                    logMessage = logMessage,
-                    completedAt = System.currentTimeMillis()
-                )
-            }
-        }
-    }
-
     private fun markTaskCompletedInDatabase(
         session: ActiveAutomationSession,
         deletedPrevious: Boolean
@@ -763,7 +948,7 @@ class WhatsAppAccessibilityService : AccessibilityService() {
                     logMessage = "Sent via Engine 1 (Foreground UI Bot) to \"${session.targetGroupName}\"$suffix.",
                     completedAt = System.currentTimeMillis()
                 )
-                delay(900L)
+                delay(600L)
                 performGlobalAction(GLOBAL_ACTION_HOME)
             } catch (e: Exception) {
                 Log.e(TAG, "Failed updating Room DB after task completion", e)

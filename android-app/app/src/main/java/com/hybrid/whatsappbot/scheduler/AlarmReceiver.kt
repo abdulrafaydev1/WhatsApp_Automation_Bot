@@ -112,8 +112,9 @@ class AlarmReceiver : BroadcastReceiver() {
                     logMessage = "Phone UNLOCKED & Screen ON -> Running Engine 1 (UI Bot) with 15s Fail-Safe Watchdog."
                 )
 
-                // 1. Lock the 25-second window in AutomationStateManager
-                AutomationStateManager.activateSession(
+                // 1. Lock the 25-second window in AutomationStateManager with alternating invisible tag
+                val activeSession = AutomationStateManager.activateSession(
+                    context = context,
                     taskId = task.taskId,
                     targetGroupName = task.targetGroupName,
                     caption = task.caption,
@@ -132,12 +133,12 @@ class AlarmReceiver : BroadcastReceiver() {
                     Intent.FLAG_GRANT_READ_URI_PERMISSION
                 )
 
-                // 4. Launch WhatsApp ACTION_SEND Share Sheet directly
+                // 4. Launch WhatsApp ACTION_SEND Share Sheet directly with taggedCaption
                 val sendIntent = Intent(Intent.ACTION_SEND).apply {
                     `package` = whatsAppPackage
                     type = "image/*"
                     putExtra(Intent.EXTRA_STREAM, contentUri)
-                    putExtra(Intent.EXTRA_TEXT, task.caption)
+                    putExtra(Intent.EXTRA_TEXT, activeSession.taggedCaption)
                     clipData = ClipData.newRawUri("scheduled_media", contentUri)
                     addFlags(
                         Intent.FLAG_ACTIVITY_NEW_TASK or

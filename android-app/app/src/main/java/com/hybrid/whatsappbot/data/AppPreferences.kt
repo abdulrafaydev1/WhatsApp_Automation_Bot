@@ -25,14 +25,21 @@ class AppPreferences(context: Context) {
         return prefs.getString(key, "") ?: ""
     }
 
-    fun markPostSentInGroup(groupName: String, caption: String) {
+    fun getLastSentTag(groupName: String): String {
+        val key = buildGroupTagKey(groupName)
+        return prefs.getString(key, "") ?: ""
+    }
+
+    fun markPostSentInGroup(groupName: String, baseCaption: String, sentTag: String) {
         val sentKey = buildGroupSentKey(groupName)
         val captionKey = buildGroupCaptionKey(groupName)
-        val snippet = caption.trim().lineSequence().firstOrNull()?.take(40)?.trim()
-            ?: caption.trim().take(40)
+        val tagKey = buildGroupTagKey(groupName)
+        val snippet = baseCaption.trim().lineSequence().firstOrNull()?.take(40)?.trim()
+            ?: baseCaption.trim().take(40)
         prefs.edit()
             .putBoolean(sentKey, true)
             .putString(captionKey, snippet)
+            .putString(tagKey, sentTag)
             .apply()
     }
 
@@ -41,6 +48,9 @@ class AppPreferences(context: Context) {
 
     private fun buildGroupCaptionKey(groupName: String): String =
         "group_last_caption_${groupName.trim().lowercase()}"
+
+    private fun buildGroupTagKey(groupName: String): String =
+        "group_last_tag_${groupName.trim().lowercase()}"
 
     companion object {
         private const val PREFS_NAME = "hybrid_whatsapp_bot_prefs"

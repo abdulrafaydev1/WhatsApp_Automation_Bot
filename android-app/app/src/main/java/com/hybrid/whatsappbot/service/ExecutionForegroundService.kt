@@ -116,6 +116,10 @@ class ExecutionForegroundService : Service() {
 
         while (System.currentTimeMillis() < deadline) {
             delay(500L)
+            if (AutomationStateManager.isFinalSendAlreadyClicked()) {
+                Log.i(TAG, "Watchdog confirmed Engine 1 Send button clicked for task $taskId. Disarming watchdog so delete-previous flow can complete.")
+                return
+            }
             val currentTask = dao.getTaskById(taskId) ?: return
             if (currentTask.status == TaskStatus.COMPLETED_UI ||
                 currentTask.status == TaskStatus.COMPLETED_BACKGROUND
@@ -123,6 +127,10 @@ class ExecutionForegroundService : Service() {
                 Log.i(TAG, "Watchdog confirmed task $taskId finished via ${currentTask.status}. Disarming watchdog.")
                 return
             }
+        }
+
+        if (AutomationStateManager.isFinalSendAlreadyClicked()) {
+            return
         }
 
         // 15 seconds elapsed without completion: Abort UI automation & fallback to Engine 2
@@ -208,7 +216,7 @@ class ExecutionForegroundService : Service() {
                 AutomationStateManager.markPostSentInGroup(
                     context = applicationContext,
                     groupName = task.targetGroupName,
-                    caption = task.caption
+                    baseCaption = task.caption
                 )
                 val msgIdInfo = body.messageId ?: "OK"
                 dao.updateTaskStatus(
